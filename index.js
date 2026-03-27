@@ -9,7 +9,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const AIRTABLE_BASE_ID = "appHB2bNYPAhfUcLv";
-const AIRTABLE_TABLE = "Nýtt/óflokkað";
+const AIRTABLE_TABLE = "tblWLlNxZvtkFSFXs";
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 
 app.get("/order/:recordId", async (req, res) => {
