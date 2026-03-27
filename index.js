@@ -14,8 +14,10 @@ const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 
 app.get("/order/:recordId", async (req, res) => {
 const { recordId } = req.params;
+      console.log("HIT /order route - recordId:", recordId);
 
 try {
+          console.log("Fetching Airtable URL:", `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE)}/${recordId}`);
 const response = await fetch(
 `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${encodeURIComponent(AIRTABLE_TABLE)}/${recordId}`,
 {
