@@ -17,12 +17,17 @@ import express from "express";
   const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;                                                            
   const ACTIVATION_TO = process.env.ACTIVATION_TO || "pax@airportassociates.com";
                                                                                                                         
-  const mailer = nodemailer.createTransport({                                      
-    service: "gmail",                                                                                                   
-    auth: {                                                         
-      user: GMAIL_USER,                                                                                                 
-      pass: GMAIL_APP_PASSWORD,                                                    
-    },                                                                                                                  
+const mailer = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,                                                                                                          
+    secure: true,
+    auth: {                                                                                                             
+      user: GMAIL_USER,                                     
+      pass: GMAIL_APP_PASSWORD,
+    },
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,                                                                                             
+    socketTimeout: 20000,
   });                                                                                                                   
                                                      
   app.get("/order/:recordId", async (req, res) => {                                                                     
