@@ -87,7 +87,9 @@ import express from "express";
       return res.status(500).json({ error: "Email service not configured" });
     }
 
-    const recipient = (typeof to === "string" && to.trim()) || ACTIVATION_TO;
+    // TEMP: redirect all activation emails to runar@bagbee.is for testing — revert after.
+    const recipient = "runar@bagbee.is";
+    void to;
 
     const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
     const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
