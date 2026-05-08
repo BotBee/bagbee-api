@@ -1,7 +1,6 @@
 import express from "express";
   import fetch from "node-fetch";
   import cors from "cors";
-  import nodemailer from "nodemailer";
 
   const app = express();
   app.use(cors());
@@ -13,22 +12,10 @@ import express from "express";
   const AIRTABLE_TABLE = "tblWLlNxZvtkFSFXs";
   const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 
-  const GMAIL_USER = process.env.GMAIL_USER;
-  const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
-  const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <bagbee@bagbee.is>";
+  const RESEND_API_KEY = process.env.RESEND_API_KEY;
+  const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <onboarding@resend.dev>";
   const ACTIVATION_TO = process.env.ACTIVATION_TO || "pax@airportassociates.com";
-
-  const mailTransport =
-    GMAIL_USER && GMAIL_APP_PASSWORD
-      ? nodemailer.createTransport({
-          host: "smtp.gmail.com",
-          port: 587,
-          secure: false,
-          requireTLS: true,
-          auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
-          connectionTimeout: 10000,
-        })
-      : null;                                       
+  const ACTIVATION_CC = process.env.ACTIVATION_CC || "bagbee@bagbee.is";                                       
                                                                                                                         
   app.get("/order/:recordId", async (req, res) => {                                                                     
     const { recordId } = req.params;                                                                                    
@@ -86,14 +73,12 @@ import express from "express";
       return res.status(400).json({ error: "tagNumbers must be a non-empty array" });
     }
 
-    if (!mailTransport) {
-      console.error("Missing GMAIL_USER / GMAIL_APP_PASSWORD env vars");
+    if (!RESEND_API_KEY) {
+      console.error("Missing RESEND_API_KEY env var");
       return res.status(500).json({ error: "Email service not configured" });
     }
 
-    // TEMP: redirect all activation emails to runar@bagbee.is for testing — revert after.
-    const recipient = "runar@bagbee.is";
-    void to;
+    const recipient = (typeof to === "string" && to.trim()) || ACTIVATION_TO;
 
     const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
     const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
@@ -103,16 +88,31 @@ import express from "express";
     `;
 
     try {
-      const info = await mailTransport.sendMail({
-        from: ACTIVATION_FROM,
-        to: recipient,
-        subject: `Inactive bag tags — please activate (${tagNumbers.length})`,
-        text,
-        html,
+      const r = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: ACTIVATION_FROM,
+          to: [recipient],
+          cc: ACTIVATION_CC ? [ACTIVATION_CC] : undefined,
+          subject: `Inactive bag tags — please activate (${tagNumbers.length})`,
+          text,
+          html,
+        }),
       });
 
-      console.log(`[activation] sent ${tagNumbers.length} tags to ${recipient}, id=${info.messageId}`);
-      res.json({ ok: true, count: tagNumbers.length, id: info.messageId });
+      const result = await r.json();
+
+      if (!r.ok) {
+        console.error("[activation] Resend error:", r.status, result);
+        return res.status(500).json({ error: "Failed to send email", detail: result });
+      }
+
+      console.log(`[activation] sent ${tagNumbers.length} tags to ${recipient} (cc ${ACTIVATION_CC || "none"}), id=${result.id}`);
+      res.json({ ok: true, count: tagNumbers.length, id: result.id });
     } catch (err) {
       console.error("[activation] send failed:", err);
       res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });
