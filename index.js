@@ -21,8 +21,12 @@ import express from "express";
   const mailTransport =
     GMAIL_USER && GMAIL_APP_PASSWORD
       ? nodemailer.createTransport({
-          service: "gmail",
+          host: "smtp.gmail.com",
+          port: 587,
+          secure: false,
+          requireTLS: true,
           auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+          connectionTimeout: 10000,
         })
       : null;                                       
                                                                                                                         
