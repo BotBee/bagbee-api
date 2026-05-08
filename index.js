@@ -1,20 +1,30 @@
-import express from "express";                                                                                        
-  import fetch from "node-fetch";                           
-  import cors from "cors";                                                                                              
-   
-  const app = express();                                                                                                
-  app.use(cors());                                          
+import express from "express";
+  import fetch from "node-fetch";
+  import cors from "cors";
+  import nodemailer from "nodemailer";
+
+  const app = express();
+  app.use(cors());
   app.use(express.json());
 
-  const PORT = process.env.PORT || 3000;                                                                                
-   
-  const AIRTABLE_BASE_ID = "appHB2bNYPAhfUcLv";                                                                         
-  const AIRTABLE_TABLE = "tblWLlNxZvtkFSFXs";               
-  const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;                                                                    
-                                                                                                                        
-  const RESEND_API_KEY = process.env.RESEND_API_KEY;                                                                    
-  const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <onboarding@resend.dev>";                              
-  const ACTIVATION_TO = process.env.ACTIVATION_TO || "pax@airportassociates.com";                                       
+  const PORT = process.env.PORT || 3000;
+
+  const AIRTABLE_BASE_ID = "appHB2bNYPAhfUcLv";
+  const AIRTABLE_TABLE = "tblWLlNxZvtkFSFXs";
+  const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
+
+  const GMAIL_USER = process.env.GMAIL_USER;
+  const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+  const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <bagbee@bagbee.is>";
+  const ACTIVATION_TO = process.env.ACTIVATION_TO || "pax@airportassociates.com";
+
+  const mailTransport =
+    GMAIL_USER && GMAIL_APP_PASSWORD
+      ? nodemailer.createTransport({
+          service: "gmail",
+          auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+        })
+      : null;                                       
                                                                                                                         
   app.get("/order/:recordId", async (req, res) => {                                                                     
     const { recordId } = req.params;                                                                                    
@@ -65,54 +75,42 @@ import express from "express";
     }                                                       
   });
 
-  app.post("/send-activation-request", async (req, res) => {                                                            
-    const { tagNumbers } = req.body || {};
-                                                                                                                        
-    if (!Array.isArray(tagNumbers) || tagNumbers.length === 0) {
-      return res.status(400).json({ error: "tagNumbers must be a non-empty array" });                                   
-    }                                                                                                                   
-   
-    if (!RESEND_API_KEY) {                                                                                              
-      console.error("Missing RESEND_API_KEY env var");      
-      return res.status(500).json({ error: "Email service not configured" });                                           
-    }
-                                                                                                                        
-    const lines = tagNumbers.map((t) => `• ${t}`).join("\n");                                                           
-    const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
-    const html = `                                                                                                      
-      <p>Please activate these inactive bag tags:</p>       
-      <ul>${tagNumbers.map((t) => `<li><code>${t}</code></li>`).join("")}</ul>                                          
-    `;                                                                                                                  
-                                                                                                                        
-    try {                                                                                                               
-      const r = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${RESEND_API_KEY}`,                                                                    
-          "Content-Type": "application/json",
-        },                                                                                                              
-        body: JSON.stringify({                              
-          from: ACTIVATION_FROM,                                                                                        
-          to: [ACTIVATION_TO],
-          subject: `Inactive bag tags — please activate (${tagNumbers.length})`,                                        
-          text,                                                                                                         
-          html,
-        }),                                                                                                             
-      });                                                   
+  app.post("/send-activation-request", async (req, res) => {
+    const { tagNumbers, to } = req.body || {};
 
-      const result = await r.json();                                                                                    
-   
-      if (!r.ok) {                                                                                                      
-        console.error("[activation] Resend error:", r.status, result);
-        return res.status(500).json({ error: "Failed to send email", detail: result });
-      }                                                                                                                 
-   
-      console.log(`[activation] sent ${tagNumbers.length} tags, id=${result.id}`);                                      
-      res.json({ ok: true, count: tagNumbers.length, id: result.id });
-    } catch (err) {                                                                                                     
-      console.error("[activation] send failed:", err);      
-      res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });                      
-    }                                                                                                                   
+    if (!Array.isArray(tagNumbers) || tagNumbers.length === 0) {
+      return res.status(400).json({ error: "tagNumbers must be a non-empty array" });
+    }
+
+    if (!mailTransport) {
+      console.error("Missing GMAIL_USER / GMAIL_APP_PASSWORD env vars");
+      return res.status(500).json({ error: "Email service not configured" });
+    }
+
+    const recipient = (typeof to === "string" && to.trim()) || ACTIVATION_TO;
+
+    const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
+    const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
+    const html = `
+      <p>Please activate these inactive bag tags:</p>
+      <ul>${tagNumbers.map((t) => `<li><code>${t}</code></li>`).join("")}</ul>
+    `;
+
+    try {
+      const info = await mailTransport.sendMail({
+        from: ACTIVATION_FROM,
+        to: recipient,
+        subject: `Inactive bag tags — please activate (${tagNumbers.length})`,
+        text,
+        html,
+      });
+
+      console.log(`[activation] sent ${tagNumbers.length} tags to ${recipient}, id=${info.messageId}`);
+      res.json({ ok: true, count: tagNumbers.length, id: info.messageId });
+    } catch (err) {
+      console.error("[activation] send failed:", err);
+      res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });
+    }
   });
                                                                                                                         
   app.listen(PORT, () => {                                  
