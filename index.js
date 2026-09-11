@@ -115,12 +115,37 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
   }
 });
 
+/// Paid orders from today onward, soonest first.
+///
+/// Today counts as upcoming: a pickup later today is still ahead of the driver.
+/// Orders with no pickup date are left out — they cannot be scheduled, and in a
+/// check-in list an undated row is a trap.
+app.get("/app/orders/upcoming", requireAppToken, async (req, res) => {
+  const formula = `AND({Greitt}, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}')))`;
+  const params = new URLSearchParams({ filterByFormula: formula, maxRecords: "100" });
+  params.set("sort[0][field]", "Dagsetning pick-up");
+  params.set("sort[0][direction]", "asc");
+
+  try {
+    res.json(await airtableFetch(`${airtableURL(AIRTABLE_TABLE)}?${params}`));
+  } catch (err) {
+    sendAirtableError(res, err, "orders/upcoming");
+  }
+});
+
 app.get("/app/orders/search", requireAppToken, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   if (!q) return res.status(400).json({ error: "q is required" });
 
+  // `upcoming=1` drops orders whose pickup has passed. Opt-in, so the older
+  // callers of this endpoint keep searching the full history.
+  const upcomingOnly = req.query.upcoming === "1";
+  const dateClause = upcomingOnly
+    ? `, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}'))`
+    : "";
+
   const safe = escapeFormulaValue(q.toLowerCase());
-  const formula = `AND({Greitt}, OR(` +
+  const formula = `AND({Greitt}${dateClause}, OR(` +
     `FIND('${safe}', LOWER({Nafn viðskiptavinar})),` +
     `FIND('${safe}', LOWER({Delivery Address})),` +
     `FIND('${safe}', LOWER({Pöntunarnúmer (fx)}))` +
