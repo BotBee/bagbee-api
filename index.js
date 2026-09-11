@@ -115,6 +115,48 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
   }
 });
 
+/// The colour Airtable holds against each `Requested service` choice, so the
+/// app can colour order rows from the base instead of a palette baked into a
+/// release. Recolour a choice in Airtable and every phone follows.
+///
+/// Cached in memory for an hour: the schema changes when someone edits a select,
+/// which is roughly never, and this is called on every app launch.
+///
+/// Reads the base schema, which needs `schema.bases:read` on AIRTABLE_TOKEN —
+/// a different scope from the record read/write the rest of these routes use. If
+/// it is missing this returns 200 with an empty map rather than an error, and
+/// the app keeps the choices it already has.
+let serviceColorCache = { at: 0, value: null };
+
+app.get("/app/order-colors", requireAppToken, async (req, res) => {
+  const HOUR = 60 * 60 * 1000;
+  if (serviceColorCache.value && Date.now() - serviceColorCache.at < HOUR) {
+    return res.json(serviceColorCache.value);
+  }
+
+  try {
+    const schema = await airtableFetch(
+      `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID}/tables`
+    );
+    const table = (schema.tables || []).find((t) => t.id === AIRTABLE_TABLE);
+    const field = (table?.fields || []).find((f) => f.name === "Requested service");
+
+    const service = {};
+    for (const choice of field?.options?.choices || []) {
+      if (choice.name && choice.color) service[choice.name] = choice.color;
+    }
+
+    const payload = { service };
+    serviceColorCache = { at: Date.now(), value: payload };
+    res.json(payload);
+  } catch (err) {
+    // Deliberately not an error to the app: colour is a nicety, and the app
+    // carries its own copy.
+    console.warn("[order-colors] falling back to empty:", err.message);
+    res.json({ service: {} });
+  }
+});
+
 /// Paid orders for one pickup day. `date` is YYYY-MM-DD and defaults to today.
 ///
 /// The date is matched against a strict pattern before it reaches the formula —
