@@ -115,6 +115,27 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
   }
 });
 
+/// Paid orders for one pickup day. `date` is YYYY-MM-DD and defaults to today.
+///
+/// The date is matched against a strict pattern before it reaches the formula —
+/// it is interpolated into Airtable's filter string, so anything else would be
+/// an injection point.
+app.get("/app/orders/day", requireAppToken, async (req, res) => {
+  const date = (req.query.date || "").toString().trim() || todayISO();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+  }
+
+  const formula = `AND(IS_SAME({Dagsetning pick-up}, '${date}', 'day'), {Greitt})`;
+  const params = new URLSearchParams({ filterByFormula: formula, maxRecords: "100" });
+
+  try {
+    res.json(await airtableFetch(`${airtableURL(AIRTABLE_TABLE)}?${params}`));
+  } catch (err) {
+    sendAirtableError(res, err, "orders/day");
+  }
+});
+
 /// Paid orders from today onward, soonest first.
 ///
 /// Today counts as upcoming: a pickup later today is still ahead of the driver.
