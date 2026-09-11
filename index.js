@@ -117,6 +117,82 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
 
 const STOPS_TABLE = "tblE3fYDSuk7dKPdF";          // Optimo Stops
 
+/// Records a bag tag issued by BagChain against its order.
+///
+/// Without this a tag exists at BagChain and at the airline but nowhere on our
+/// side: the order page cannot show it, the bag cannot be found by its number
+/// later, and a damage claim has no trail.
+///
+/// Keyed on the tag number, which is a licence plate and unique. An existing row
+/// is FILLED IN, never overwritten — rows are also created by the delivery flow
+/// and by hand, and a check-in arriving afterwards must not wipe an attachment
+/// or a Delivered tick. The app may resend the same tag after a dropped
+/// connection, so this has to be safe to call twice.
+app.post("/app/tags", requireAppToken, async (req, res) => {
+  const b = req.body || {};
+  const tagNumber = String(b.tagNumber || "").trim();
+  if (!tagNumber) return res.status(400).json({ error: "tagNumber is required" });
+
+  // Only fields with something in them; a blank must never clear a filled cell.
+  const incoming = {};
+  const put = (field, value) => {
+    const v = typeof value === "string" ? value.trim() : value;
+    if (v !== undefined && v !== null && v !== "") incoming[field] = v;
+  };
+  put("BagTag Number", tagNumber);
+  put("Order No", b.orderNumber);
+  put("Passenger Name", b.passengerName);
+  put("PNR", b.pnr);
+  put("Flight", b.flight);
+  put("Destination", b.destination);
+  put("BCBP Raw", b.bcbpRaw);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(b.flightDate || ""))) {
+    incoming["Flight Date"] = b.flightDate;
+  }
+
+  try {
+    const found = await airtableFetch(
+      `${airtableURL(TAG_TABLE)}?${new URLSearchParams({
+        filterByFormula: `{BagTag Number}='${escapeFormulaValue(tagNumber)}'`,
+        maxRecords: "1",
+      })}`
+    );
+    const existing = (found.records || [])[0];
+
+    if (existing) {
+      const fields = {};
+      for (const [key, value] of Object.entries(incoming)) {
+        const current = existing.fields[key];
+        if (current === undefined || current === null || current === "") fields[key] = value;
+      }
+      // The link is a list, so "already linked" means the order is in it.
+      const links = existing.fields["Order No copy"] || [];
+      if (b.orderRecordId && !links.includes(b.orderRecordId)) {
+        fields["Order No copy"] = [...links, b.orderRecordId];
+      }
+      if (!Object.keys(fields).length) {
+        return res.json({ id: existing.id, created: false, updated: false });
+      }
+      const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${existing.id}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields }),
+      });
+      return res.json({ id: updated.id, created: false, updated: true });
+    }
+
+    if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
+    const created = await airtableFetch(airtableURL(TAG_TABLE), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: incoming, typecast: true }),
+    });
+    res.json({ id: created.id, created: true, updated: false });
+  } catch (err) {
+    sendAirtableError(res, err, "tags");
+  }
+});
+
 /// Every page of a filtered table read, not just the first 100.
 ///
 /// A busy day is two stops per order across several drivers and runs well past
