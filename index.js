@@ -115,6 +115,129 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
   }
 });
 
+const STOPS_TABLE = "tblE3fYDSuk7dKPdF";          // Optimo Stops
+
+/// Every page of a filtered table read, not just the first 100.
+///
+/// A busy day is two stops per order across several drivers and runs well past
+/// one page; silently returning the first hundred would drop the end of the
+/// evening route, which is exactly the part someone is checking at 17:00.
+async function airtableFetchAll(table, params, { maxPages = 6 } = {}) {
+  const records = [];
+  let offset;
+  for (let page = 0; page < maxPages; page++) {
+    const q = new URLSearchParams(params);
+    q.set("pageSize", "100");
+    if (offset) q.set("offset", offset);
+    const data = await airtableFetch(`${airtableURL(table)}?${q}`);
+    records.push(...(data.records || []));
+    offset = data.offset;
+    if (!offset) break;
+  }
+  return records;
+}
+
+/// The day's route as OptimoRoute planned it: every stop in sequence, grouped by
+/// driver, carrying enough of its order to draw the same row the order lists
+/// draw.
+///
+/// Stops and orders are joined here rather than in the app. Optimo writes the
+/// sequence onto the stop and the service and agency live on the order, and an
+/// app that fetched both would be making the same two calls over a phone
+/// connection in a van.
+///
+/// An order appears twice, once per leg: Optimo suffixes the delivery leg "-D".
+app.get("/app/route", requireAppToken, async (req, res) => {
+  const date = (req.query.date || "").toString().trim() || todayISO();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+  }
+
+  try {
+    const stopRecords = await airtableFetchAll(STOPS_TABLE, {
+      filterByFormula:
+        `DATETIME_FORMAT(ARRAYJOIN({Dagsetning pick-up (from Related Order)}),'YYYY-MM-DD')='${date}'`,
+    });
+
+    // A stop with no sequence has not been planned yet — Optimo fills the
+    // number, the time and the driver together.
+    const planned = stopRecords.filter((r) => typeof r.fields.stopNumber === "number");
+
+    // Fetch the orders behind these stops in one go, so each row can carry its
+    // service and agency and be coloured like every other order list.
+    const orderNumbers = [
+      ...new Set(planned.map((r) => baseOrderNumber(r.fields["Order Number"])).filter(Boolean)),
+    ];
+    const orders = orderNumbers.length
+      ? await airtableFetchAll(AIRTABLE_TABLE, {
+          filterByFormula: `OR(${orderNumbers
+            .map((n) => `{Pöntunarnúmer (fx)}='${escapeFormulaValue(n)}'`)
+            .join(",")})`,
+        })
+      : [];
+
+    const orderByNumber = new Map();
+    for (const o of orders) orderByNumber.set(o.fields["Pöntunarnúmer (fx)"], o);
+
+    const stops = planned
+      .map((r) => {
+        const f = r.fields;
+        const number = baseOrderNumber(f["Order Number"]);
+        const order = orderByNumber.get(number);
+        const of = order?.fields || {};
+        return {
+          stopNumber: f.stopNumber,
+          scheduledAt: f.scheduledAt || null,
+          driver: f.Driver || "Unassigned",
+          leg: isDeliveryLeg(f["Order Number"]) ? "delivery" : "pickup",
+          done: Boolean(isDeliveryLeg(f["Order Number"]) ? f["Delivery completed"] : f["Pickup completed"]),
+          locationName: f.locationName || null,
+          address: f.address || first(of["Heimilisfang"]) || null,
+          orderNumber: number,
+          recordId: order?.id || null,
+          customerName: of["Nafn viðskiptavinar"] || first(f["Nafn viðskiptavinar (from Related Order)"]) || "",
+          requestedService: of["Requested service"] || "",
+          reference: of["Reference"] || "",
+          totalBags: of["Total amount of bags"] || 0,
+          timeWindow: of["Tímasetning"] || "",
+          trackingURL: f["Tracking URL"] || null,
+        };
+      })
+      .sort((a, b) => a.stopNumber - b.stopNumber);
+
+    const byDriver = new Map();
+    for (const stop of stops) {
+      if (!byDriver.has(stop.driver)) byDriver.set(stop.driver, []);
+      byDriver.get(stop.driver).push(stop);
+    }
+
+    res.json({
+      date,
+      planned: stops.length > 0,
+      stopCount: stops.length,
+      drivers: [...byDriver.entries()]
+        .map(([driver, driverStops]) => ({ driver, stops: driverStops }))
+        .sort((a, b) => a.driver.localeCompare(b.driver)),
+    });
+  } catch (err) {
+    sendAirtableError(res, err, "route");
+  }
+});
+
+/// Optimo suffixes the delivery leg of an order "-D"; both legs point at the
+/// same order.
+function isDeliveryLeg(orderNumber) {
+  return /-D$/i.test(String(orderNumber || ""));
+}
+
+function baseOrderNumber(orderNumber) {
+  return String(orderNumber || "").replace(/-D$/i, "");
+}
+
+function first(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
 /// The colour Airtable holds against each `Requested service` choice, so the
 /// app can colour order rows from the base instead of a palette baked into a
 /// release. Recolour a choice in Airtable and every phone follows.
