@@ -261,12 +261,27 @@ app.get("/app/route", requireAppToken, async (req, res) => {
         const number = baseOrderNumber(f["Order Number"]);
         const order = orderByNumber.get(number);
         const of = order?.fields || {};
+        const delivery = isDeliveryLeg(f["Order Number"]);
         return {
           stopNumber: f.stopNumber,
           scheduledAt: f.scheduledAt || null,
           driver: f.Driver || "Unassigned",
-          leg: isDeliveryLeg(f["Order Number"]) ? "delivery" : "pickup",
-          done: Boolean(isDeliveryLeg(f["Order Number"]) ? f["Delivery completed"] : f["Pickup completed"]),
+          leg: delivery ? "delivery" : "pickup",
+          // The stop's own id and its untouched order number. A completion must
+          // be posted against the LEG, and the delivery leg is the one carrying
+          // the "-D" suffix — posting the stripped number would finish the
+          // pickup instead and leave the delivery silently open.
+          stopRecordId: r.id,
+          optimoOrderNo: f["Order Number"] || null,
+          // Coordinates, not the address: Optimo's address is free text, every
+          // delivery leg reads "Keflavík International Airport", and Icelandic
+          // house letters (Laugavegur 27b) geocode badly.
+          latitude: typeof f.latitude === "number" ? f.latitude : null,
+          longitude: typeof f.longitude === "number" ? f.longitude : null,
+          // Pickup legs only. A delivery leg carries no customer contact by
+          // deliberate rule — the bag goes to an airline, not to a person.
+          phone: delivery ? null : of["Símanúmer"] || null,
+          done: Boolean(delivery ? f["Delivery completed"] : f["Pickup completed"]),
           locationName: f.locationName || null,
           address: f.address || first(of["Heimilisfang"]) || null,
           orderNumber: number,
