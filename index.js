@@ -170,6 +170,13 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       if (b.orderRecordId && !links.includes(b.orderRecordId)) {
         fields["Order No copy"] = [...links, b.orderRecordId];
       }
+      // A tag claimed from a boarding pass has no order — a BCBP carries a PNR,
+      // not an order number, and nothing in the base joins the two. It links to
+      // the Úthringingar passenger row the check-in run worked from instead.
+      const uth = existing.fields["Úthringingar"] || [];
+      if (b.uthringingarRecordId && !uth.includes(b.uthringingarRecordId)) {
+        fields["Úthringingar"] = [...uth, b.uthringingarRecordId];
+      }
       if (!Object.keys(fields).length) {
         return res.json({ id: existing.id, created: false, updated: false });
       }
@@ -182,6 +189,7 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
     }
 
     if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
+    if (b.uthringingarRecordId) incoming["Úthringingar"] = [b.uthringingarRecordId];
     const created = await airtableFetch(airtableURL(TAG_TABLE), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
