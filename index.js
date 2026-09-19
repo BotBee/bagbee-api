@@ -2,9 +2,42 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import crypto from "crypto";
+// The only static import from src/: node:crypto + src/auth/jwt.js, and it never
+// throws at import, so it cannot stop the driver routes from booting. Feeds the
+// staff-JWT second check in requireAppToken (spec §4.9 edit (3), build step B8).
+import { staffFromJwt, APP_ROUTES_ACCEPT_STAFF_JWT } from "./src/appJwt.js";
 
 const app = express();
+app.set("trust proxy", 1);
 app.use(cors());
+// /v2 bodies are small JSON; parsing them first keeps a 20mb upload off the new
+// routes. body-parser skips a body that is already parsed, so /app/* is unchanged.
+app.use("/v2", express.json({ limit: "32kb" }));
+
+/// body-parser rejects a malformed or oversized body with next(err), and an error
+/// walks FORWARD past every ordinary middleware — including the /v2 stub below and
+/// the /v2 router's own error handler inside it. Without this, a bad body on a /v2
+/// path landed on Express's default HTML error page: a stack trace the app cannot
+/// decode, on a path any client can hit at will. Mounted directly behind the
+/// parser and scoped to /v2, so an /app/* body error still takes the old route to
+/// the old page, byte for byte (§4.2).
+const V2_BODY_ERRORS = {
+  "entity.parse.failed": [400, "invalid_json"],
+  "entity.too.large": [413, "payload_too_large"],
+  "encoding.unsupported": [415, "unsupported_media_type"],
+  "charset.unsupported": [415, "unsupported_media_type"],
+  "request.aborted": [400, "invalid_request"],
+  "request.size.invalid": [400, "invalid_request"],
+};
+// eslint-disable-next-line no-unused-vars -- Express needs the 4-arg shape
+app.use("/v2", (err, req, res, next) => {
+  const mapped = err && typeof err.type === "string" ? V2_BODY_ERRORS[err.type] : null;
+  // Anything that is not a body-parser failure is none of this handler's business.
+  if (!mapped || res.headersSent) return next(err);
+  console.error(`[v2] body rejected: ${err.type}`);
+  return res.status(mapped[0]).json({ error: mapped[1] });
+});
+
 // Delivery photos are posted as base64, so the default 100kb body limit is far too small.
 app.use(express.json({ limit: "20mb" }));
 
@@ -35,23 +68,39 @@ const R2_PUBLIC_URL = process.env.R2_PUBLIC_URL;    // https://pub-....r2.dev
 // Auth
 // ---------------------------------------------------------------------------
 
-/// Guards every route the app calls. Fails closed: if APP_TOKEN isn't set on the
-/// server, nothing is served rather than everything.
+/// Guards every route the app calls (spec §2.1, §4.9 edit (3)).
+///
+/// The shared x-app-token is checked first and exactly as before: a request that
+/// carries the right one takes the same path it always has. A staff JWT is a
+/// SECOND way in, off unless APP_ROUTES_ACCEPT_STAFF_JWT=1, so deploying slice 1
+/// changes nothing here until the flag is flipped. Fails closed: if APP_TOKEN
+/// isn't set on the server, nothing is served rather than everything.
 function requireAppToken(req, res, next) {
+  const supplied = req.get("x-app-token") || "";
+  if (APP_TOKEN && supplied) {
+    const a = Buffer.from(supplied);
+    const b = Buffer.from(APP_TOKEN);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return next();
+  }
+
+  // Synchronous signature + expiry check only (no DB), so this path cannot fail
+  // on Postgres; a revoked session lingers here for at most 15 min (§4.9). The
+  // token's identity lands on req.staff in the same shape /v2's requireStaff
+  // uses, so a handler that wants to know who is calling reads one field. The
+  // shared-token path sets nothing: a shared secret is not a person.
+  if (APP_ROUTES_ACCEPT_STAFF_JWT) {
+    const staff = staffFromJwt(req);
+    if (staff) {
+      req.staff = staff;
+      return next();
+    }
+  }
+
   if (!APP_TOKEN) {
     console.error("APP_TOKEN is not set — refusing app requests");
     return res.status(503).json({ error: "Server not configured" });
   }
-
-  const supplied = req.get("x-app-token") || "";
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(APP_TOKEN);
-
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-
-  next();
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +199,13 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
     incoming["Flight Date"] = b.flightDate;
   }
 
+  // The label and the vendor's record travel with the tag from build 41 on. A
+  // caller that doesn't send them is unaffected: both come back "none".
+  const label = normalizeLabel(b.zpl);
+  const tagData = normalizeTagData(b.tagData);
+  if (label.status === "invalid") console.warn(`[tags] ${tagNumber}: label ignored — ${label.why}`);
+  if (tagData.status === "invalid") console.warn(`[tags] ${tagNumber}: tagData ignored — ${tagData.why}`);
+
   try {
     const found = await airtableFetch(
       `${airtableURL(TAG_TABLE)}?${new URLSearchParams({
@@ -165,6 +221,54 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
         const current = existing.fields[key];
         if (current === undefined || current === null || current === "") fields[key] = value;
       }
+
+      // "Tag data" is reference data — the vendor's own record for this plate.
+      // Plain fill-blanks, like every other field above.
+      let tagDataStatus = tagData.status === "ok" ? "unchanged" : tagData.status;
+      if (tagData.status === "ok" && isBlankCell(existing.fields["Tag data"])) {
+        fields["Tag data"] = tagData.value;
+        tagDataStatus = "stored";
+      }
+
+      // "Label ZPL" is NOT plain fill-blanks, because it is the one field that
+      // ends up on paper wrapped around a bag.
+      //
+      //   blank (or whitespace) stored  -> write it. A row created by the
+      //       delivery flow, or by a claim whose render failed, has no label and
+      //       must be able to gain one later — that is the whole point of the
+      //       field: claimed on the Mac, printed from a phone.
+      //   byte-identical             -> no write. The app resends a tag after a
+      //       dropped connection, and the Mac logs the same tag again on reprint.
+      //   different                  -> REFUSED, and said so in the reply.
+      //       A stored label describes a plate that is already printed and
+      //       stuck to a suitcase. Two renders of the same tag should be
+      //       identical (same template, same 22-dot shift), so a difference
+      //       means one of the two is wrong — most likely an older or newer
+      //       template — and quietly replacing it would hand a driver a reprint
+      //       that does not match the tag on the bag. First render wins; the
+      //       caller gets label:"conflict" and can show it.
+      //   replaceLabel:true          -> overwrite anyway, reported as
+      //       label:"replaced". The deliberate, non-silent way to fix a label
+      //       stored from a broken template. Nothing sends it today.
+      let labelStatus = label.status === "ok" ? "unchanged" : label.status;
+      if (label.status === "ok") {
+        const stored = typeof existing.fields["Label ZPL"] === "string"
+          ? existing.fields["Label ZPL"].trim() : "";
+        if (!stored) {
+          fields["Label ZPL"] = label.value;
+          labelStatus = "stored";
+        } else if (stored !== label.value) {
+          if (b.replaceLabel === true) {
+            fields["Label ZPL"] = label.value;
+            labelStatus = "replaced";
+            console.warn(`[tags] ${tagNumber}: stored label REPLACED on request`);
+          } else {
+            labelStatus = "conflict";
+            console.warn(`[tags] ${tagNumber}: a different label is already stored — kept the stored one`);
+          }
+        }
+      }
+
       // The link is a list, so "already linked" means the order is in it.
       const links = existing.fields["Order No copy"] || [];
       if (b.orderRecordId && !links.includes(b.orderRecordId)) {
@@ -178,28 +282,96 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
         fields["Úthringingar"] = [...uth, b.uthringingarRecordId];
       }
       if (!Object.keys(fields).length) {
-        return res.json({ id: existing.id, created: false, updated: false });
+        return res.json({
+          id: existing.id, created: false, updated: false,
+          label: labelStatus, tagData: tagDataStatus,
+        });
       }
       const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${existing.id}`), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fields }),
       });
-      return res.json({ id: updated.id, created: false, updated: true });
+      return res.json({
+        id: updated.id, created: false, updated: true,
+        label: labelStatus, tagData: tagDataStatus,
+      });
     }
 
     if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
     if (b.uthringingarRecordId) incoming["Úthringingar"] = [b.uthringingarRecordId];
+    if (label.status === "ok") incoming["Label ZPL"] = label.value;
+    if (tagData.status === "ok") incoming["Tag data"] = tagData.value;
     const created = await airtableFetch(airtableURL(TAG_TABLE), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fields: incoming, typecast: true }),
     });
-    res.json({ id: created.id, created: true, updated: false });
+    res.json({
+      id: created.id, created: true, updated: false,
+      label: label.status === "ok" ? "stored" : label.status,
+      tagData: tagData.status === "ok" ? "stored" : tagData.status,
+    });
   } catch (err) {
     sendAirtableError(res, err, "tags");
   }
 });
+
+/// An Airtable cell that holds nothing. Airtable drops an empty long-text field
+/// from the record entirely, but a row edited by hand can leave whitespace
+/// behind, and whitespace is not a label.
+function isBlankCell(value) {
+  if (value === undefined || value === null) return true;
+  return typeof value === "string" && value.trim() === "";
+}
+
+// A rendered tag is ~1.9 kB and the vendor's record ~0.9 kB; these caps are ten
+// times that, and exist only so a runaway caller cannot push a 100k-character
+// field at Airtable and get a 422 back instead of a logged tag.
+const MAX_LABEL_CHARS = 20000;
+const MAX_TAG_DATA_CHARS = 20000;
+
+/// Validates an incoming label WITHOUT ever failing the request.
+///
+/// A bad label must not cost us the tag row: the tag number is the licence
+/// plate of a bag that is already on a belt, and losing it to a rejected body
+/// would be far worse than storing no label. So anything unusable is reported
+/// as "invalid" and simply not written — the rest of the upsert still happens.
+function normalizeLabel(value) {
+  if (value === undefined || value === null) return { status: "none" };
+  if (typeof value !== "string") return { status: "invalid", why: "not a string" };
+  const zpl = value.trim();
+  if (!zpl) return { status: "none" };
+  // Every label the Swift and Python templates render opens with ^XA. Something
+  // without it is not a label, and a printer handed it would jam or sit idle.
+  if (!zpl.includes("^XA")) return { status: "invalid", why: "not ZPL" };
+  if (zpl.length > MAX_LABEL_CHARS) return { status: "invalid", why: "too long" };
+  return { status: "ok", value: zpl };
+}
+
+/// The vendor's BagTagData record, as an object or as the JSON text of one.
+/// Stored pretty-printed: the cell is read by people in Airtable when a tag has
+/// to be explained, and by whatever re-renders a label the stored ZPL lost.
+function normalizeTagData(value) {
+  if (value === undefined || value === null) return { status: "none" };
+  let object = value;
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return { status: "none" };
+    try {
+      object = JSON.parse(text);
+    } catch {
+      return { status: "invalid", why: "not JSON" };
+    }
+  }
+  // An array is almost certainly the whole `bagTags` list; one record per row.
+  if (typeof object !== "object" || object === null || Array.isArray(object)) {
+    return { status: "invalid", why: "not an object" };
+  }
+  const text = JSON.stringify(object, null, 2);
+  if (!text || text.length > MAX_TAG_DATA_CHARS) return { status: "invalid", why: "too long" };
+  return { status: "ok", value: text };
+}
 
 /// Every page of a filtered table read, not just the first 100.
 ///
@@ -473,6 +645,262 @@ app.get("/app/tags/find", requireAppToken, async (req, res) => {
   }
 });
 
+/// An Airtable record id. An order's `Pöntunarnúmer (fx)` is RIGHT(RECORD_ID(), 5)
+/// and a bag tag number is all digits, so neither can be mistaken for one.
+const AIRTABLE_RECORD_ID = /^rec[A-Za-z0-9]{14}$/;
+
+/// Whether a failed single-record GET means the record simply isn't there.
+///
+/// Airtable answers a fetch of a row that does not exist with 403
+/// INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND — it will not say which of the two it
+/// is — and sometimes 404. A driver opening a deleted order has to see "no
+/// tags", not an error.
+///
+/// A 404 is unambiguous. A 403 is NOT, and reading it as "missing" on its own is
+/// how an outage turns into "engir töskumiðar skráðir á þessa pöntun" on a
+/// driver's phone — a sentence read with a bag already in hand, and therefore
+/// the one that must never be a lie. The app's common path passes a record id
+/// (PassengerRecord.bagTagOrderRef prefers recordId), so this branch, not the
+/// search below it, is what a permissions or token failure would go through.
+///
+/// So a 403 is re-asked as a list query for the same id. The list endpoint
+/// answers an id it cannot find with an empty page and a token that has lost the
+/// table with an error of its own — which distinguishes the two cases Airtable
+/// refuses to. Empty means gone; anything else throws, and the caller reports
+/// the outage as an outage.
+///
+/// Logged either way: if the token really has lost the table then
+/// /app/orders/today and /app/route are failing at the same moment, and these
+/// lines are what explain a suspiciously empty tag list next to them.
+async function recordIsMissing(err, table, id, what) {
+  if (err.status !== 403 && err.status !== 404) return false;
+  if (err.status === 404) {
+    console.warn(`[airtable] ${what}: 404, treating as not found`);
+    return true;
+  }
+
+  const found = await airtableFetch(
+    `${airtableURL(table)}?${new URLSearchParams({
+      filterByFormula: `RECORD_ID()='${escapeFormulaValue(id)}'`,
+      maxRecords: "1",
+    })}`
+  );
+  const missing = !((found.records || []).length);
+  console.warn(
+    `[airtable] ${what}: 403, and a list query ${missing ? "cannot find it either — treating as not found" : "CAN see it — not treating as not found"}`
+  );
+  return missing;
+}
+
+const TAG_LIST_FIELDS = [
+  "BagTag Number", "Order No", "Passenger Name", "PNR",
+  "Flight", "Flight Date", "Destination", "Delivered", "Label ZPL",
+];
+
+/// The order behind either identifier, or null if there is no such order.
+///
+/// Returns the linked tag rows as well: the link lives on Orders as the inverse
+/// of the tag table's "Order No copy", and it is the only way to find a tag that
+/// was linked but never had its "Order No" text filled in.
+async function findOrder(ref) {
+  if (AIRTABLE_RECORD_ID.test(ref)) {
+    try {
+      const record = await airtableFetch(airtableURL(AIRTABLE_TABLE, `/${ref}`));
+      return {
+        id: record.id,
+        number: record.fields["Pöntunarnúmer (fx)"] || null,
+        tagIds: record.fields["Tag numbers"] || [],
+      };
+    } catch (err) {
+      // A record id that is well formed but gone is a missing order, not a fault.
+      if (await recordIsMissing(err, AIRTABLE_TABLE, ref, `order ${ref}`)) return null;
+      throw err;
+    }
+  }
+
+  const found = await airtableFetch(
+    `${airtableURL(AIRTABLE_TABLE)}?${new URLSearchParams({
+      filterByFormula: `{Pöntunarnúmer (fx)}='${escapeFormulaValue(ref)}'`,
+      maxRecords: "1",
+    })}`
+  );
+  const record = (found.records || [])[0];
+  if (!record) return null;
+  return {
+    id: record.id,
+    number: record.fields["Pöntunarnúmer (fx)"] || ref,
+    tagIds: record.fields["Tag numbers"] || [],
+  };
+}
+
+function chunk(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
+function tagSummary(record) {
+  const f = record.fields || {};
+  const zpl = typeof f["Label ZPL"] === "string" ? f["Label ZPL"].trim() : "";
+  return {
+    recordId: record.id,
+    tagNumber: f["BagTag Number"] || null,
+    passengerName: f["Passenger Name"] || null,
+    pnr: f["PNR"] || null,
+    flight: f["Flight"] || null,
+    flightDate: f["Flight Date"] || null,
+    destination: f["Destination"] || null,
+    delivered: Boolean(f["Delivered"]),
+    hasLabel: zpl !== "",
+    createdAt: record.createdTime || null,
+    _zpl: zpl,
+  };
+}
+
+/// Every bag tag on one order, so a tag claimed on the Mac can be printed from a
+/// phone that never saw the claim.
+///
+/// `:orderRef` is either the 5-character Pöntunarnúmer or the Orders record id —
+/// the app has both on a route stop and on an order screen, and either works.
+///
+/// A tag reaches its order by one of two routes and this returns the union of
+/// them: the "Order No" text, which every logger fills, and the "Order No copy"
+/// link, which is filled only when the claiming side managed to resolve the
+/// order's record id. A row can have either without the other.
+///
+/// The labels are NOT in this answer by default. A rendered tag is ~1.9 kB and a
+/// golf group runs to 32 bags, so carrying them all would turn a list of names
+/// into a 65 kB download over a van's connection, for a screen where the driver
+/// prints one tag at a time. `hasLabel` says whether there is one to fetch, and
+/// GET /app/tags/:tagRef/label fetches it when the driver taps print.
+/// `?labels=1` overrides that and embeds them, for pre-loading the day's labels
+/// on the depot's wifi before driving out of coverage.
+app.get("/app/orders/:orderRef/tags", requireAppToken, async (req, res) => {
+  const ref = String(req.params.orderRef || "").trim();
+  if (!ref) return res.status(400).json({ error: "orderRef is required" });
+  const withLabels = req.query.labels === "1";
+
+  try {
+    const order = await findOrder(ref);
+
+    // No such order is an empty list, not a failure. A driver who mistypes a
+    // number, or opens an order that has been deleted, should see "no tags" —
+    // and so should the app, without a branch for it.
+    if (!order) {
+      return res.json({
+        found: false, orderNumber: null, orderRecordId: null, count: 0, tags: [],
+      });
+    }
+
+    const clauses = order.number ? [`{Order No}='${escapeFormulaValue(order.number)}'`] : [];
+    for (const id of order.tagIds) clauses.push(`RECORD_ID()='${escapeFormulaValue(id)}'`);
+
+    // Chunked so a very large group cannot build a filter longer than Airtable
+    // will accept in a URL. One request covers anything realistic.
+    const byId = new Map();
+    for (const group of chunk(clauses, 100)) {
+      const formula = group.length === 1 ? group[0] : `OR(${group.join(",")})`;
+      const params = [["filterByFormula", formula]];
+      for (const field of TAG_LIST_FIELDS) params.push(["fields[]", field]);
+      for (const record of await airtableFetchAll(TAG_TABLE, params)) {
+        byId.set(record.id, record);
+      }
+    }
+
+    // Oldest first: tags are claimed one after another for a group, so creation
+    // order is the order they were claimed and printed in, which is the order
+    // of the stack in the driver's hand.
+    const tags = [...byId.values()]
+      .map(tagSummary)
+      .sort((a, b) =>
+        (a.createdAt || "").localeCompare(b.createdAt || "") ||
+        String(a.tagNumber || "").localeCompare(String(b.tagNumber || ""))
+      )
+      .map(({ _zpl, ...tag }) => (withLabels ? { ...tag, zpl: _zpl || null } : tag));
+
+    res.json({
+      found: true,
+      orderNumber: order.number,
+      orderRecordId: order.id,
+      count: tags.length,
+      tags,
+    });
+  } catch (err) {
+    sendAirtableError(res, err, "orders/:orderRef/tags");
+  }
+});
+
+/// One tag's label, fetched when someone is about to print it.
+///
+/// `:tagRef` is the tag's Airtable record id (from the list above) or the bag tag
+/// number itself, so a scanned barcode reaches the label in one call.
+///
+/// `tagData` — the vendor's own record for this plate — comes with it. When a
+/// tag was claimed before the label was stored, or the stored label came from a
+/// template that has since been fixed, the client can render the label itself
+/// from this exactly as the Mac and the app already do.
+///
+/// A tag that isn't there answers 200 with found:false rather than 404: this is
+/// a lookup, the same as /app/tags/find, and a scan of someone else's bag tag is
+/// an ordinary outcome and not an error to be handled separately.
+app.get("/app/tags/:tagRef/label", requireAppToken, async (req, res) => {
+  const ref = String(req.params.tagRef || "").trim();
+  if (!ref) return res.status(400).json({ error: "tagRef is required" });
+
+  try {
+    let record = null;
+    if (AIRTABLE_RECORD_ID.test(ref)) {
+      try {
+        record = await airtableFetch(airtableURL(TAG_TABLE, `/${ref}`));
+      } catch (err) {
+        if (!(await recordIsMissing(err, TAG_TABLE, ref, `tag ${ref}`))) throw err;
+      }
+    } else {
+      const found = await airtableFetch(
+        `${airtableURL(TAG_TABLE)}?${new URLSearchParams({
+          filterByFormula: `{BagTag Number}='${escapeFormulaValue(ref)}'`,
+          maxRecords: "1",
+        })}`
+      );
+      record = (found.records || [])[0] || null;
+    }
+
+    if (!record) {
+      return res.json({ found: false, recordId: null, tagNumber: null, hasLabel: false, zpl: null, tagData: null });
+    }
+
+    const f = record.fields || {};
+    const zpl = typeof f["Label ZPL"] === "string" ? f["Label ZPL"].trim() : "";
+    let tagData = null;
+    if (typeof f["Tag data"] === "string" && f["Tag data"].trim()) {
+      try {
+        tagData = JSON.parse(f["Tag data"]);
+      } catch {
+        // Stored by hand or by an older writer. The label is the point of this
+        // route; a record we cannot parse is reported as absent, not as a fault.
+        console.warn(`[tags/label] ${record.id}: "Tag data" is not JSON`);
+      }
+    }
+
+    res.json({
+      found: true,
+      recordId: record.id,
+      tagNumber: f["BagTag Number"] || null,
+      passengerName: f["Passenger Name"] || null,
+      pnr: f["PNR"] || null,
+      flight: f["Flight"] || null,
+      flightDate: f["Flight Date"] || null,
+      destination: f["Destination"] || null,
+      orderNumber: f["Order No"] || null,
+      hasLabel: zpl !== "",
+      zpl: zpl || null,
+      tagData,
+    });
+  } catch (err) {
+    sendAirtableError(res, err, "tags/:tagRef/label");
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Fast Track — create
 // ---------------------------------------------------------------------------
@@ -701,8 +1129,28 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// BagBee Vakt (/v2)
+// ---------------------------------------------------------------------------
+
+/// A delegating stub. /v2 is served by src/vakt.js once it has loaded; until then,
+/// or if loading failed, /v2 answers 503 and /app/* is unaffected. The import is
+/// dynamic on purpose: a malformed APNS_KEY_P8 throws ERR_OSSL_UNSUPPORTED from
+/// crypto.createPrivateKey, and as a static import that would crash-loop the
+/// process before listen and take every driver route down with it.
+let v2Handler = null;
+let v2LoadError = false;
+app.use("/v2", (req, res, next) => {
+  if (v2Handler) return v2Handler(req, res, next);
+  res.set("Retry-After", "30").status(503).json({ error: v2LoadError ? "vakt_unavailable" : "starting" });
+});
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  import("./src/vakt.js")
+    .then((m) => m.startVakt({ app, server }))           // returns the /v2 router; DB/worker failures only affect /v2
+    .then((handler) => { v2Handler = handler; })
+    .catch((e) => { v2LoadError = true; console.error("[vakt] failed to load /v2:", e?.code || e?.message); });
 });
