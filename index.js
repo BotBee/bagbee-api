@@ -177,6 +177,13 @@ const STOPS_TABLE = "tblE3fYDSuk7dKPdF";          // Optimo Stops
 /// and by hand, and a check-in arriving afterwards must not wipe an attachment
 /// or a Delivered tick. The app may resend the same tag after a dropped
 /// connection, so this has to be safe to call twice.
+///
+/// A tag whose number is new but whose boarding pass was scanned earlier as a
+/// fallback (POST /app/passes — airport check-in down) fills THAT pending row,
+/// matched on "BCBP Raw" among rows with no plate, instead of adding a second
+/// row for the same bag. The reply then also carries `filledPending: true`, and
+/// `label` can be "cleared" (see below); every existing key is unchanged, and a
+/// claim with no pending row behind it is the same create as before.
 app.post("/app/tags", requireAppToken, async (req, res) => {
   const b = req.body || {};
   const tagNumber = String(b.tagNumber || "").trim();
@@ -213,7 +220,18 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
         maxRecords: "1",
       })}`
     );
-    const existing = (found.records || [])[0];
+    let existing = (found.records || [])[0];
+
+    // No row carries this plate yet. If the pass it was claimed for was scanned
+    // earlier as a fallback, that pending row IS this bag's row and is filled
+    // in — the order must end up with one row per bag, or the pass and its tag
+    // count as two. Costs one read, and only on a claim of a brand-new tag.
+    let pendingFill = false;
+    if (!existing && incoming["BCBP Raw"]) {
+      existing = await pendingRowForPass(incoming["BCBP Raw"]);
+      pendingFill = Boolean(existing);
+      if (pendingFill) console.log(`[tags] ${tagNumber}: filling the pending pass row ${existing.id}`);
+    }
 
     if (existing) {
       const fields = {};
@@ -251,7 +269,26 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       //       label:"replaced". The deliberate, non-silent way to fix a label
       //       stored from a broken template. Nothing sends it today.
       let labelStatus = label.status === "ok" ? "unchanged" : label.status;
-      if (label.status === "ok") {
+      if (pendingFill) {
+        // A pending row's label, when it has one, is BagBee's OWN fallback
+        // label: the passenger's name and the order, printed while the airport
+        // system was down — and no plate, because there was none. It describes
+        // the pass, not this tag, so the never-replace rule below does not
+        // protect it: the real label lands over it ("replaced"), and a claim
+        // that brought no label CLEARS it ("cleared") rather than leave it to
+        // pose as the tag's label. A blank cell can still gain the real label
+        // from a later reprint log; a lingering fallback would block that for
+        // good as a "conflict".
+        const stored = typeof existing.fields["Label ZPL"] === "string"
+          ? existing.fields["Label ZPL"].trim() : "";
+        if (label.status === "ok") {
+          if (stored !== label.value) fields["Label ZPL"] = label.value;
+          labelStatus = !stored ? "stored" : stored === label.value ? "unchanged" : "replaced";
+        } else if (stored) {
+          fields["Label ZPL"] = null;
+          labelStatus = "cleared";
+        }
+      } else if (label.status === "ok") {
         const stored = typeof existing.fields["Label ZPL"] === "string"
           ? existing.fields["Label ZPL"].trim() : "";
         if (!stored) {
@@ -281,10 +318,11 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       if (b.uthringingarRecordId && !uth.includes(b.uthringingarRecordId)) {
         fields["Úthringingar"] = [...uth, b.uthringingarRecordId];
       }
+      const extra = pendingFill ? { filledPending: true } : {};
       if (!Object.keys(fields).length) {
         return res.json({
           id: existing.id, created: false, updated: false,
-          label: labelStatus, tagData: tagDataStatus,
+          label: labelStatus, tagData: tagDataStatus, ...extra,
         });
       }
       const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${existing.id}`), {
@@ -294,7 +332,7 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       });
       return res.json({
         id: updated.id, created: false, updated: true,
-        label: labelStatus, tagData: tagDataStatus,
+        label: labelStatus, tagData: tagDataStatus, ...extra,
       });
     }
 
@@ -330,6 +368,14 @@ function isBlankCell(value) {
 // field at Airtable and get a 422 back instead of a logged tag.
 const MAX_LABEL_CHARS = 20000;
 const MAX_TAG_DATA_CHARS = 20000;
+// The fallback label (POST /app/passes) is a different size of thing. The app
+// reproduces the scanned pass on it as an UNCOMPRESSED ^GF bitmap about 380
+// dots wide, and a mobile pass's Aztec or QR comes to 35-41k characters of hex
+// before the label's own text — twice the tag cap, which silently dropped every
+// one of them as "too long" and left the pending row with nothing to reprint.
+// There is one such label per bag, never 32 per group, so 60k is a comfortable
+// ceiling that still sits well under Airtable's 100k limit on a long-text cell.
+const MAX_PASS_LABEL_CHARS = 60000;
 
 /// Validates an incoming label WITHOUT ever failing the request.
 ///
@@ -337,7 +383,7 @@ const MAX_TAG_DATA_CHARS = 20000;
 /// plate of a bag that is already on a belt, and losing it to a rejected body
 /// would be far worse than storing no label. So anything unusable is reported
 /// as "invalid" and simply not written — the rest of the upsert still happens.
-function normalizeLabel(value) {
+function normalizeLabel(value, maxChars = MAX_LABEL_CHARS) {
   if (value === undefined || value === null) return { status: "none" };
   if (typeof value !== "string") return { status: "invalid", why: "not a string" };
   const zpl = value.trim();
@@ -345,7 +391,7 @@ function normalizeLabel(value) {
   // Every label the Swift and Python templates render opens with ^XA. Something
   // without it is not a label, and a printer handed it would jam or sit idle.
   if (!zpl.includes("^XA")) return { status: "invalid", why: "not ZPL" };
-  if (zpl.length > MAX_LABEL_CHARS) return { status: "invalid", why: "too long" };
+  if (zpl.length > maxChars) return { status: "invalid", why: "too long" };
   return { status: "ok", value: zpl };
 }
 
@@ -372,6 +418,235 @@ function normalizeTagData(value) {
   if (!text || text.length > MAX_TAG_DATA_CHARS) return { status: "invalid", why: "too long" };
   return { status: "ok", value: text };
 }
+
+// ---------------------------------------------------------------------------
+// Boarding passes scanned while the airport check-in is down
+// ---------------------------------------------------------------------------
+
+/// Formula fragment for a Tag numbers row that has no plate yet.
+///
+/// `&''` coerces the cell to text first, so a blank compares the same whatever
+/// the field's type; a pending row missed here becomes a duplicate row the
+/// moment its tag is claimed.
+const NO_TAG = "LEN({BagTag Number}&'')=0";
+
+/// Every row that carries this boarding pass, split into the ones still waiting
+/// for a plate and the ones that have one.
+///
+/// A pass is NOT unique among claimed rows — a passenger with two bags has two
+/// rows with the same raw and two different plates — so the raw is a key only
+/// for the pending row, of which there is at most one per pass (POST /app/passes
+/// dedupes on it). Oldest pending first, in case two ever slipped through.
+async function passRows(raw) {
+  const found = await airtableFetch(
+    `${airtableURL(TAG_TABLE)}?${new URLSearchParams({
+      filterByFormula: `{BCBP Raw}='${escapeFormulaValue(raw)}'`,
+      maxRecords: "50",
+    })}`
+  );
+  const pending = [];
+  const claimed = [];
+  for (const record of found.records || []) {
+    (isBlankCell(record.fields?.["BagTag Number"]) ? pending : claimed).push(record);
+  }
+  pending.sort((a, b) => (a.createdTime || "").localeCompare(b.createdTime || ""));
+  return { pending, claimed };
+}
+
+/// The one row of a pass still waiting for its plate, or null.
+async function pendingRowForPass(raw) {
+  return (await passRows(raw)).pending[0] || null;
+}
+
+/// Records a boarding pass scanned INSIDE an order while the airport check-in
+/// (BagChain → Altea) is down.
+///
+/// The driver prints BagBee's own fallback label at that point, but a label is
+/// not a record: without this the pass exists only on the paper, and when the
+/// real tag is claimed later — from a phone, or in a batch on the Mac — nothing
+/// says which order it belongs to. So the scan becomes a PENDING row in Tag
+/// numbers: the pass, the passenger and the order, and no "BagTag Number".
+/// POST /app/tags fills that row in when the plate arrives (matched on
+/// "BCBP Raw"), and GET /app/orders/:orderRef/tags lists it meanwhile with
+/// pending:true so the order screen can show it and claim from it.
+///
+/// Keyed on the raw barcode: one pending row per pass, however often it is
+/// scanned — the app retries after a dropped connection, and a driver may scan
+/// the same pass on a second phone. An existing pending row is filled in,
+/// blanks only, with links appended, exactly as /app/tags treats a tag. A pass
+/// that already has claimed rows (a passenger with two bags, or the system came
+/// back between scan and claim) still gets its pending row, and the reply lists
+/// the plates already claimed for it so the app can say so.
+///
+/// Body: bcbpRaw (required); orderNumber, orderRecordId, uthringingarRecordId,
+/// passengerName, pnr, flight, flightDate (YYYY-MM-DD), destination; zpl — the
+/// fallback label, optional, same ^XA check as /app/tags and dropped rather
+/// than failing the row, but under its own, larger cap (MAX_PASS_LABEL_CHARS):
+/// it carries the pass as a bitmap and is far bigger than a rendered tag.
+/// Reply: { id, created, updated, pending: true, label, claimedTags }.
+app.post("/app/passes", requireAppToken, async (req, res) => {
+  const b = req.body || {};
+  const raw = String(b.bcbpRaw || "").trim();
+  if (!raw) return res.status(400).json({ error: "bcbpRaw is required" });
+
+  const incoming = { "BCBP Raw": raw };
+  const put = (field, value) => {
+    const v = typeof value === "string" ? value.trim() : value;
+    if (v !== undefined && v !== null && v !== "") incoming[field] = v;
+  };
+  put("Order No", b.orderNumber);
+  put("Passenger Name", b.passengerName);
+  put("PNR", b.pnr);
+  put("Flight", b.flight);
+  put("Destination", b.destination);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(b.flightDate || ""))) {
+    incoming["Flight Date"] = b.flightDate;
+  }
+  const label = normalizeLabel(b.zpl, MAX_PASS_LABEL_CHARS);
+  if (label.status === "invalid") console.warn(`[passes] fallback label ignored — ${label.why}`);
+
+  try {
+    const { pending, claimed } = await passRows(raw);
+    const claimedTags = claimed.map((r) => String(r.fields["BagTag Number"]).trim());
+    const existing = pending[0];
+
+    if (existing) {
+      const fields = {};
+      for (const [key, value] of Object.entries(incoming)) {
+        const current = existing.fields[key];
+        if (current === undefined || current === null || current === "") fields[key] = value;
+      }
+      // The fallback label is plain fill-blanks: it is rendered from the same
+      // pass and order every time, and it is not a plate, so nothing is at
+      // stake in keeping the first one.
+      let labelStatus = label.status === "ok" ? "unchanged" : label.status;
+      if (label.status === "ok" && isBlankCell(existing.fields["Label ZPL"])) {
+        fields["Label ZPL"] = label.value;
+        labelStatus = "stored";
+      }
+      const links = existing.fields["Order No copy"] || [];
+      if (b.orderRecordId && !links.includes(b.orderRecordId)) {
+        fields["Order No copy"] = [...links, b.orderRecordId];
+      }
+      const uth = existing.fields["Úthringingar"] || [];
+      if (b.uthringingarRecordId && !uth.includes(b.uthringingarRecordId)) {
+        fields["Úthringingar"] = [...uth, b.uthringingarRecordId];
+      }
+      if (!Object.keys(fields).length) {
+        return res.json({
+          id: existing.id, created: false, updated: false, pending: true,
+          label: labelStatus, claimedTags,
+        });
+      }
+      const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${existing.id}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields }),
+      });
+      return res.json({
+        id: updated.id, created: false, updated: true, pending: true,
+        label: labelStatus, claimedTags,
+      });
+    }
+
+    if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
+    if (b.uthringingarRecordId) incoming["Úthringingar"] = [b.uthringingarRecordId];
+    if (label.status === "ok") incoming["Label ZPL"] = label.value;
+    const created = await airtableFetch(airtableURL(TAG_TABLE), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: incoming, typecast: true }),
+    });
+    res.json({
+      id: created.id, created: true, updated: false, pending: true,
+      label: label.status === "ok" ? "stored" : label.status, claimedTags,
+    });
+  } catch (err) {
+    sendAirtableError(res, err, "passes");
+  }
+});
+
+const PASS_LIST_FIELDS = [
+  "BCBP Raw", "Order No", "Order No copy", "Úthringingar", "Passenger Name", "PNR",
+  "Flight", "Flight Date", "Destination", "Label ZPL",
+];
+
+/// The pending passes of one pickup day, for the Mac's batch claim
+/// (claim_pending.py): every fallback-scanned pass whose ORDER is picked up on
+/// `date`, joined through the orders' "Dagsetning pick-up" — a read, nothing on
+/// Orders is written. The pending rows are fetched whole (there are few: each
+/// is filled the moment its tag is claimed) and the day's orders once, with only
+/// the fields the join needs, and the join runs here, so no formula grows with
+/// the size of the day.
+///
+/// A pass reaches its order by the "Order No copy" link or the "Order No" text,
+/// whichever the scan managed to fill — the same two routes as the tag list.
+/// Unpaid orders are included and marked `paid:false`, so a caller that is
+/// about to claim can decide for itself.
+app.get("/app/passes/pending", requireAppToken, async (req, res) => {
+  const date = (req.query.date || "").toString().trim() || todayISO();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+  }
+
+  try {
+    const orderParams = [["filterByFormula", `IS_SAME({Dagsetning pick-up}, '${date}', 'day')`]];
+    for (const field of ["Pöntunarnúmer (fx)", "Nafn viðskiptavinar", "Greitt", "Dagsetning pick-up"]) {
+      orderParams.push(["fields[]", field]);
+    }
+    const orders = await airtableFetchAll(AIRTABLE_TABLE, orderParams);
+    // A day with no orders has no pending passes, and costs no second read.
+    if (!orders.length) return res.json({ date, count: 0, passes: [] });
+
+    const byId = new Map();
+    const byNumber = new Map();
+    for (const order of orders) {
+      byId.set(order.id, order);
+      const number = order.fields?.["Pöntunarnúmer (fx)"];
+      if (number) byNumber.set(number, order);
+    }
+
+    const pendingParams = [["filterByFormula", `AND(${NO_TAG}, LEN({BCBP Raw}&'')>0)`]];
+    for (const field of PASS_LIST_FIELDS) pendingParams.push(["fields[]", field]);
+    const rows = await airtableFetchAll(TAG_TABLE, pendingParams);
+
+    const passes = [];
+    for (const row of rows) {
+      const f = row.fields || {};
+      const order = (f["Order No copy"] || []).map((id) => byId.get(id)).find(Boolean)
+        || byNumber.get(f["Order No"]) || null;
+      if (!order) continue;
+      const zpl = typeof f["Label ZPL"] === "string" ? f["Label ZPL"].trim() : "";
+      passes.push({
+        recordId: row.id,
+        bcbpRaw: String(f["BCBP Raw"]).trim(),
+        passengerName: f["Passenger Name"] || null,
+        pnr: f["PNR"] || null,
+        flight: f["Flight"] || null,
+        flightDate: f["Flight Date"] || null,
+        destination: f["Destination"] || null,
+        orderNumber: order.fields["Pöntunarnúmer (fx)"] || f["Order No"] || null,
+        orderRecordId: order.id,
+        customerName: order.fields["Nafn viðskiptavinar"] || null,
+        paid: Boolean(order.fields["Greitt"]),
+        pickupDate: order.fields["Dagsetning pick-up"] || null,
+        uthringingarRecordId: (f["Úthringingar"] || [])[0] || null,
+        hasLabel: zpl !== "",
+        createdAt: row.createdTime || null,
+      });
+    }
+    // Grouped by order, oldest scan first within it: the order a driver scanned
+    // a household's passes in.
+    passes.sort((a, b) =>
+      String(a.orderNumber || "").localeCompare(String(b.orderNumber || "")) ||
+      (a.createdAt || "").localeCompare(b.createdAt || "")
+    );
+
+    res.json({ date, count: passes.length, passes });
+  } catch (err) {
+    sendAirtableError(res, err, "passes/pending");
+  }
+});
 
 /// Every page of a filtered table read, not just the first 100.
 ///
@@ -694,7 +969,7 @@ async function recordIsMissing(err, table, id, what) {
 
 const TAG_LIST_FIELDS = [
   "BagTag Number", "Order No", "Passenger Name", "PNR",
-  "Flight", "Flight Date", "Destination", "Delivered", "Label ZPL",
+  "Flight", "Flight Date", "Destination", "Delivered", "Label ZPL", "BCBP Raw",
 ];
 
 /// The order behind either identifier, or null if there is no such order.
@@ -742,9 +1017,11 @@ function chunk(list, size) {
 function tagSummary(record) {
   const f = record.fields || {};
   const zpl = typeof f["Label ZPL"] === "string" ? f["Label ZPL"].trim() : "";
+  const tagNumber = f["BagTag Number"] || null;
+  const raw = typeof f["BCBP Raw"] === "string" ? f["BCBP Raw"].trim() : "";
   return {
     recordId: record.id,
-    tagNumber: f["BagTag Number"] || null,
+    tagNumber,
     passengerName: f["Passenger Name"] || null,
     pnr: f["PNR"] || null,
     flight: f["Flight"] || null,
@@ -753,6 +1030,11 @@ function tagSummary(record) {
     delivered: Boolean(f["Delivered"]),
     hasLabel: zpl !== "",
     createdAt: record.createdTime || null,
+    // A row with no plate is a boarding pass scanned while the airport check-in
+    // was down (POST /app/passes), waiting for its tag. The raw is what the app
+    // claims from; on a claimed row it is only the pass the tag was issued for.
+    pending: tagNumber === null,
+    bcbpRaw: raw || null,
     _zpl: zpl,
   };
 }
@@ -767,6 +1049,11 @@ function tagSummary(record) {
 /// them: the "Order No" text, which every logger fills, and the "Order No copy"
 /// link, which is filled only when the claiming side managed to resolve the
 /// order's record id. A row can have either without the other.
+///
+/// Pending passes (POST /app/passes) are in the list too, in their place by
+/// creation time, with `tagNumber: null`, `pending: true` and the `bcbpRaw` the
+/// app needs to claim the real tag from. `hasLabel` on one of them means the
+/// fallback label is stored, and /app/tags/:recordId/label prints it as usual.
 ///
 /// The labels are NOT in this answer by default. A rendered tag is ~1.9 kB and a
 /// golf group runs to 32 bags, so carrying them all would turn a list of names

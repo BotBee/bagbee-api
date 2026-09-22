@@ -301,6 +301,10 @@ test("the tag list is reachable by the 5-char order number", async () => {
     delivered: true,
     hasLabel: true,
     createdAt: "2026-09-18T09:00:00.000Z",
+    // Since 2026-09-19 (fallback passes): a claimed tag is not pending, and
+    // this row never stored the pass it was issued for.
+    pending: false,
+    bcbpRaw: null,
   });
   assert.equal(body.tags[1].hasLabel, false, "a tag with no label says so");
   assert.equal(body.tags[1].delivered, false);

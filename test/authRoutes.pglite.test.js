@@ -66,7 +66,11 @@ async function serve({ people = [OWNER], envOver = {}, lookupDelayMs = 0, mailFa
   await migrate(db.pool, MIGRATIONS_DIR);
   db.ready = true;
 
-  let nowMs = Date.now();
+  // Today, but pinned to 08:00 UTC. The throttle's daily windows are aligned
+  // to UTC days, so a test that advances the clock a few hours must not start
+  // late enough in the real day to cross midnight — it did, and the suite
+  // failed only in the evening.
+  let nowMs = Math.floor(Date.now() / 86_400_000) * 86_400_000 + 8 * 3_600_000;
   const clock = () => new Date(nowMs);
 
   /// Mutable, so a test can turn someone Inactive between two requests.

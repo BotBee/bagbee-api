@@ -1,0 +1,558 @@
+// Boarding passes scanned while the airport check-in is down (2026-09-19).
+//
+// When BagChain → Altea is down the driver scans the pass inside the order and
+// prints BagBee's own fallback label. Until now that left nothing behind but the
+// paper: the real tag, claimed later on a phone or in a batch on the Mac, had
+// no order to land on. Now the scan is a PENDING row in Tag numbers — the pass,
+// the passenger, the order, and no plate — and the claim fills it in.
+//
+// Four things are covered: POST /app/passes creating and deduping the pending
+// row, POST /app/tags filling it (and leaving every existing caller's path
+// exactly as it was), the per-order list showing it, and the per-day query the
+// Mac's claim_pending.py reads. Everything drives the real index.js through
+// test/_indexHarness.js, so nothing here touches api.airtable.com and no test
+// can be satisfied by a re-implementation of the wiring.
+
+import test, { after } from "node:test";
+import assert from "node:assert/strict";
+import { bootIndex, airtable, APP_TOKEN } from "./_indexHarness.js";
+
+const boot = await bootIndex();
+after(() => boot.close());
+
+const ORDERS = "tblWLlNxZvtkFSFXs";
+const TAGS = "tblVyZakUmK0CY0YJ";
+const AUTH = { "x-app-token": APP_TOKEN };
+
+// One passenger's pass as the scanner hands it over, with the two labels that
+// can be stored against it: BagBee's fallback (no plate) and the real one.
+const RAW = "M1JONSDOTTIR/SIGRIDUR EABC123 KEFPRGFI 0542 262Y012A0001 100";
+const FALLBACK_ZPL = "^XA^FO20,30^FDJONSDOTTIR/SIGRIDUR^FS^FO20,80^FDi0lYC JON JONSSON^FS^XZ";
+const REAL_ZPL = "^XA^MNM^MTD^FO20,30^FDJONSDOTTIR/S^FS^FO20,200^FD0592123456^FS^XZ";
+const TAG_DATA = { tagNumber: "0592123456", pnrData: "ABC123", airlineName: "ICELANDAIR" };
+
+const SCAN = {
+  bcbpRaw: RAW,
+  orderNumber: "i0lYC",
+  orderRecordId: "recORDER000000001",
+  uthringingarRecordId: "recUTH00000000001",
+  passengerName: "JONSDOTTIR/SIGRIDUR",
+  pnr: "ABC123",
+  flight: "FI 542",
+  flightDate: "2026-09-19",
+  destination: "PRG",
+  zpl: FALLBACK_ZPL,
+};
+
+/// The row POST /app/passes leaves behind for SCAN.
+const PENDING_ROW = {
+  id: "recPASS0000000001",
+  createdTime: "2026-09-19T08:00:00.000Z",
+  fields: {
+    "BCBP Raw": RAW, "Order No": "i0lYC", "Order No copy": ["recORDER000000001"],
+    "Úthringingar": ["recUTH00000000001"], "Passenger Name": "JONSDOTTIR/SIGRIDUR",
+    PNR: "ABC123", Flight: "FI 542", "Flight Date": "2026-09-19", Destination: "PRG",
+    "Label ZPL": FALLBACK_ZPL,
+  },
+};
+
+/// A tag already claimed for the same pass — the passenger's other bag.
+const CLAIMED_ROW = {
+  id: "recTAGCLAIMED0001",
+  createdTime: "2026-09-19T07:00:00.000Z",
+  fields: { "BagTag Number": "0592111111", "BCBP Raw": RAW, "Order No": "i0lYC", "Passenger Name": "JONSDOTTIR/SIGRIDUR" },
+};
+
+function post(path, body, headers = AUTH) {
+  return boot.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+const formulaOf = (url) => decodeURIComponent(new URL(url).searchParams.get("filterByFormula") || "");
+const fieldsOf = (url) => new URL(url).searchParams.getAll("fields[]").map(decodeURIComponent);
+
+/// Every write index.js made, in order, with its parsed body.
+function writes() {
+  return airtable.calls
+    .filter((c) => c.options.method === "PATCH" || c.options.method === "POST")
+    .map((c) => ({ method: c.options.method, url: c.url, body: JSON.parse(c.options.body) }));
+}
+
+/// The tag table, answered by formula: `byTag` for the plate lookup /app/tags
+/// makes first, `byRaw` for the pass lookup, and writes accepted with the id
+/// they were addressed to.
+function tagTableStub({ byTag = [], byRaw = [] } = {}) {
+  airtable.reply = (url, options = {}) => {
+    if (options.method === "PATCH") {
+      return { status: 200, body: JSON.stringify({ id: url.split("/").pop() }) };
+    }
+    if (options.method === "POST") {
+      return { status: 200, body: JSON.stringify({ id: "recPASSnew0000001" }) };
+    }
+    const formula = formulaOf(url);
+    if (formula.startsWith("{BagTag Number}=")) return { status: 200, body: JSON.stringify({ records: byTag }) };
+    if (formula.startsWith("{BCBP Raw}=")) return { status: 200, body: JSON.stringify({ records: byRaw }) };
+    return { status: 200, body: JSON.stringify({ records: [] }) };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// POST /app/passes
+// ---------------------------------------------------------------------------
+
+test("a scanned pass becomes a pending row: the pass, the order, and no plate", async () => {
+  airtable.reset();
+  tagTableStub();
+
+  const res = await post("/app/passes", SCAN);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    id: "recPASSnew0000001", created: true, updated: false, pending: true, label: "stored", claimedTags: [],
+  });
+
+  // Looked up by the raw barcode, the pending row's key.
+  assert.equal(formulaOf(airtable.calls[0].url), `{BCBP Raw}='${RAW}'`);
+
+  const [write] = writes();
+  assert.equal(write.method, "POST");
+  assert.ok(write.url.includes(TAGS));
+  assert.equal(write.body.typecast, true);
+  assert.deepEqual(write.body.fields, {
+    "BCBP Raw": RAW,
+    "Order No": "i0lYC",
+    "Order No copy": ["recORDER000000001"],
+    "Úthringingar": ["recUTH00000000001"],
+    "Passenger Name": "JONSDOTTIR/SIGRIDUR",
+    PNR: "ABC123",
+    Flight: "FI 542",
+    "Flight Date": "2026-09-19",
+    Destination: "PRG",
+    "Label ZPL": FALLBACK_ZPL,
+  });
+  assert.ok(!("BagTag Number" in write.body.fields), "a pending row has no plate");
+});
+
+test("the same pass scanned again is the same row, not a second one", async () => {
+  airtable.reset();
+  tagTableStub({ byRaw: [PENDING_ROW] });
+
+  // The app retries after a dropped connection; a second phone scans the same
+  // pass. Everything is already there, so nothing is written.
+  const res = await post("/app/passes", SCAN);
+  assert.deepEqual(await res.json(), {
+    id: "recPASS0000000001", created: false, updated: false, pending: true, label: "unchanged", claimedTags: [],
+  });
+  assert.deepEqual(writes(), []);
+});
+
+test("a pending row is filled in, blanks only, with links appended", async () => {
+  airtable.reset();
+  // A scan that got through with just the pass and the order number.
+  tagTableStub({
+    byRaw: [{ id: "recPASS0000000001", fields: { "BCBP Raw": RAW, "Order No": "i0lYC", "Order No copy": ["recORDER000000009"] } }],
+  });
+
+  const res = await post("/app/passes", { ...SCAN, orderNumber: "zzzzz" });
+  const body = await res.json();
+  assert.equal(body.updated, true);
+  assert.equal(body.label, "stored");
+
+  const [write] = writes();
+  assert.equal(write.method, "PATCH");
+  assert.ok(write.url.endsWith("/recPASS0000000001"));
+  assert.equal(write.body.fields["Order No"], undefined, "a filled cell is never overwritten");
+  assert.deepEqual(write.body.fields["Order No copy"], ["recORDER000000009", "recORDER000000001"]);
+  assert.deepEqual(write.body.fields["Úthringingar"], ["recUTH00000000001"]);
+  assert.equal(write.body.fields["Passenger Name"], "JONSDOTTIR/SIGRIDUR");
+  assert.equal(write.body.fields["Label ZPL"], FALLBACK_ZPL);
+  assert.ok(!("BagTag Number" in write.body.fields));
+});
+
+test("a pass whose bags already have tags still gets its pending row, and is told so", async () => {
+  airtable.reset();
+  tagTableStub({ byRaw: [CLAIMED_ROW] });
+
+  // The passenger's second bag, or the system came back between scan and
+  // claim. The row is made either way; the app can show the plates and decide.
+  const body = await (await post("/app/passes", SCAN)).json();
+  assert.equal(body.created, true);
+  assert.equal(body.pending, true);
+  assert.deepEqual(body.claimedTags, ["0592111111"]);
+  assert.equal(writes()[0].method, "POST");
+});
+
+test("bcbpRaw is required; a fallback label that is not ZPL is dropped, not fatal", async () => {
+  airtable.reset();
+  tagTableStub();
+
+  const missing = await post("/app/passes", { orderNumber: "i0lYC", passengerName: "JONSDOTTIR/SIGRIDUR" });
+  assert.equal(missing.status, 400);
+  assert.deepEqual(await missing.json(), { error: "bcbpRaw is required" });
+  assert.deepEqual(airtable.calls, []);
+
+  const bad = await post("/app/passes", { ...SCAN, zpl: "not a label", flightDate: "19/09/2026" });
+  const body = await bad.json();
+  assert.equal(bad.status, 200);
+  assert.equal(body.created, true);
+  assert.equal(body.label, "invalid");
+  const fields = writes()[0].body.fields;
+  assert.ok(!("Label ZPL" in fields));
+  assert.ok(!("Flight Date" in fields), "a date in the wrong shape is left out, as /app/tags does");
+});
+
+test("the fallback label has its own size cap: a pass bitmap is stored, a tag that big is still not", async () => {
+  // The app puts the scanned pass on the fallback label as an uncompressed ^GF
+  // bitmap; a 60-char pass as Aztec is ~36k hex characters, and a mobile pass
+  // as QR ~41k. Under the tag cap (20k) every one of them was dropped as "too
+  // long", and the pending row had nothing to reprint from another phone.
+  const bitmapLabel = "^XA^FO20,30^FDJONSDOTTIR/SIGRIDUR^FS^FO20,300^GFA,18144,18144,48," + "F".repeat(36288) + "^FS^XZ";
+  airtable.reset();
+  tagTableStub();
+  let body = await (await post("/app/passes", { ...SCAN, zpl: bitmapLabel })).json();
+  assert.equal(body.created, true);
+  assert.equal(body.label, "stored");
+  assert.equal(writes()[0].body.fields["Label ZPL"], bitmapLabel);
+
+  // The cap on a TAG's label is unchanged: the same bytes sent with a plate
+  // are still refused as a label, and the tag row is still written.
+  airtable.reset();
+  tagTableStub();
+  body = await (await post("/app/tags", { tagNumber: "0592123456", zpl: bitmapLabel })).json();
+  assert.equal(body.created, true);
+  assert.equal(body.label, "invalid");
+  assert.ok(!("Label ZPL" in writes()[0].body.fields));
+  assert.equal(writes()[0].body.fields["BagTag Number"], "0592123456");
+
+  // And a pass label past its own cap is dropped, not fatal — the row is
+  // still worth more than the label.
+  airtable.reset();
+  tagTableStub();
+  body = await (await post("/app/passes", { ...SCAN, zpl: "^XA".padEnd(60001, "F") })).json();
+  assert.equal(body.created, true);
+  assert.equal(body.label, "invalid");
+  assert.ok(!("Label ZPL" in writes()[0].body.fields));
+});
+
+// ---------------------------------------------------------------------------
+// POST /app/tags — the claim fills the pending row
+// ---------------------------------------------------------------------------
+
+test("a claimed tag fills the pending row for its pass instead of adding a second one", async () => {
+  airtable.reset();
+  tagTableStub({ byRaw: [PENDING_ROW] });
+
+  // Exactly what TagBookkeeping and tag_log.py send for a claim.
+  const res = await post("/app/tags", {
+    tagNumber: "0592123456",
+    orderNumber: "i0lYC",
+    orderRecordId: "recORDER000000002",
+    passengerName: "JONSDOTTIR/SIGRIDUR",
+    pnr: "ABC123",
+    flight: "FI 542",
+    flightDate: "2026-09-19",
+    destination: "PRG",
+    bcbpRaw: RAW,
+    uthringingarRecordId: "recUTH00000000001",
+    zpl: REAL_ZPL,
+    tagData: TAG_DATA,
+  });
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), {
+    id: "recPASS0000000001", created: false, updated: true,
+    label: "replaced", tagData: "stored", filledPending: true,
+  });
+
+  // The plate lookup first, as always; the pass only because it found nothing.
+  assert.equal(formulaOf(airtable.calls[0].url), "{BagTag Number}='0592123456'");
+  assert.equal(formulaOf(airtable.calls[1].url), `{BCBP Raw}='${RAW}'`);
+
+  const all = writes();
+  assert.equal(all.length, 1, "one PATCH, no POST");
+  const [write] = all;
+  assert.equal(write.method, "PATCH");
+  assert.ok(write.url.endsWith("/recPASS0000000001"));
+  assert.equal(write.body.fields["BagTag Number"], "0592123456");
+  // The fallback label is not this tag's label: the real one lands over it.
+  assert.equal(write.body.fields["Label ZPL"], REAL_ZPL);
+  assert.deepEqual(JSON.parse(write.body.fields["Tag data"]), TAG_DATA);
+  assert.deepEqual(write.body.fields["Order No copy"], ["recORDER000000001", "recORDER000000002"]);
+  assert.ok(!("Úthringingar" in write.body.fields), "a link already there is not appended twice");
+  assert.ok(!("Passenger Name" in write.body.fields), "filled cells stay filled");
+});
+
+test("a claim that brought no label clears the fallback rather than leave it posing as one", async () => {
+  airtable.reset();
+  tagTableStub({ byRaw: [PENDING_ROW] });
+
+  const body = await (await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW })).json();
+  assert.equal(body.filledPending, true);
+  assert.equal(body.label, "cleared");
+
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["BagTag Number"], "0592123456");
+  assert.equal(fields["Label ZPL"], null, "cleared, so a later reprint log can store the real one");
+});
+
+test("a pending row that stored no fallback label simply gains the real one", async () => {
+  airtable.reset();
+  const { "Label ZPL": _, ...bare } = PENDING_ROW.fields;
+  tagTableStub({ byRaw: [{ ...PENDING_ROW, fields: bare }] });
+
+  const body = await (await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW, zpl: REAL_ZPL })).json();
+  assert.equal(body.label, "stored");
+  assert.equal(writes()[0].body.fields["Label ZPL"], REAL_ZPL);
+});
+
+test("the oldest pending row for a pass is the one filled", async () => {
+  airtable.reset();
+  const younger = { ...PENDING_ROW, id: "recPASS0000000002", createdTime: "2026-09-19T09:00:00.000Z" };
+  tagTableStub({ byRaw: [younger, PENDING_ROW] });
+
+  await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW });
+  assert.ok(writes()[0].url.endsWith("/recPASS0000000001"));
+});
+
+test("a tag already known by its number never looks at the pass — the old path, byte for byte", async () => {
+  airtable.reset();
+  tagTableStub({
+    byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No": "i0lYC", "BCBP Raw": RAW } }],
+    byRaw: [PENDING_ROW],
+  });
+
+  const res = await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW, passengerName: "JONSDOTTIR/SIGRIDUR" });
+  assert.deepEqual(await res.json(), {
+    id: "recTAG00000000001", created: false, updated: true, label: "none", tagData: "none",
+  });
+
+  const reads = airtable.calls.filter((c) => !c.options.method || c.options.method === "GET");
+  assert.equal(reads.length, 1, "no second lookup when the plate is known");
+  assert.ok(writes()[0].url.endsWith("/recTAG00000000001"));
+});
+
+test("a claim with no pending row behind it is the same create as before", async () => {
+  airtable.reset();
+  // The pass has a claimed row (the other bag) but nothing pending.
+  tagTableStub({ byRaw: [CLAIMED_ROW] });
+
+  const res = await post("/app/tags", {
+    tagNumber: "0592123456", orderNumber: "i0lYC", orderRecordId: "recORDER000000001",
+    passengerName: "JONSDOTTIR/SIGRIDUR", bcbpRaw: RAW, zpl: REAL_ZPL,
+  });
+  assert.deepEqual(await res.json(), {
+    id: "recPASSnew0000001", created: true, updated: false, label: "stored", tagData: "none",
+  });
+
+  const [write] = writes();
+  assert.equal(write.method, "POST");
+  assert.equal(write.body.fields["BagTag Number"], "0592123456");
+  assert.equal(write.body.fields["BCBP Raw"], RAW);
+  assert.deepEqual(write.body.fields["Order No copy"], ["recORDER000000001"]);
+});
+
+test("a claim without a pass makes no pass lookup at all", async () => {
+  airtable.reset();
+  tagTableStub();
+
+  await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC" });
+  const reads = airtable.calls.filter((c) => !c.options.method || c.options.method === "GET");
+  assert.equal(reads.length, 1);
+  assert.equal(writes()[0].method, "POST");
+});
+
+// ---------------------------------------------------------------------------
+// GET /app/orders/:orderRef/tags — the pending pass is on the order
+// ---------------------------------------------------------------------------
+
+const ORDER = {
+  id: "recORDER000000001",
+  fields: { "Pöntunarnúmer (fx)": "i0lYC", "Tag numbers": ["recPASS0000000001"] },
+};
+
+function orderWithRowsStub(rows) {
+  airtable.reply = (url) => {
+    if (url.includes(`/${ORDERS}/`)) return { status: 200, body: JSON.stringify(ORDER) };
+    if (url.includes(`/${ORDERS}?`)) return { status: 200, body: JSON.stringify({ records: [ORDER] }) };
+    return { status: 200, body: JSON.stringify({ records: rows }) };
+  };
+}
+
+test("the order's tag list shows the pending pass, in its place, with what the app claims from", async () => {
+  airtable.reset();
+  orderWithRowsStub([PENDING_ROW, CLAIMED_ROW]);
+
+  const res = await boot.request("/app/orders/i0lYC/tags", { headers: AUTH });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+
+  assert.equal(body.found, true);
+  assert.equal(body.count, 2);
+  // Oldest first, pending or not: the claimed bag came first that morning.
+  assert.deepEqual(body.tags.map((t) => t.recordId), ["recTAGCLAIMED0001", "recPASS0000000001"]);
+
+  assert.deepEqual(body.tags[1], {
+    recordId: "recPASS0000000001",
+    tagNumber: null,
+    passengerName: "JONSDOTTIR/SIGRIDUR",
+    pnr: "ABC123",
+    flight: "FI 542",
+    flightDate: "2026-09-19",
+    destination: "PRG",
+    delivered: false,
+    hasLabel: true,
+    createdAt: "2026-09-19T08:00:00.000Z",
+    pending: true,
+    bcbpRaw: RAW,
+  });
+  assert.equal(body.tags[0].pending, false);
+  assert.equal(body.tags[0].tagNumber, "0592111111");
+  assert.equal(body.tags[0].bcbpRaw, RAW, "a claimed row keeps the pass it was issued for");
+
+  // The pass is asked for along with the rest of the row.
+  const tagCall = airtable.calls.find((c) => c.url.includes(TAGS));
+  assert.ok(fieldsOf(tagCall.url).includes("BCBP Raw"));
+});
+
+test("?labels=1 carries the fallback label of a pending pass like any other", async () => {
+  airtable.reset();
+  orderWithRowsStub([PENDING_ROW]);
+
+  const body = await (await boot.request("/app/orders/i0lYC/tags?labels=1", { headers: AUTH })).json();
+  assert.equal(body.tags[0].pending, true);
+  assert.equal(body.tags[0].zpl, FALLBACK_ZPL);
+});
+
+// ---------------------------------------------------------------------------
+// GET /app/passes/pending?date= — the Mac's batch claim
+// ---------------------------------------------------------------------------
+
+const DAY_ORDERS = [
+  { id: "recORDER000000001", fields: { "Pöntunarnúmer (fx)": "i0lYC", "Nafn viðskiptavinar": "Jón Jónsson", Greitt: true, "Dagsetning pick-up": "2026-09-19" } },
+  { id: "recORDER000000002", fields: { "Pöntunarnúmer (fx)": "zzzzz", "Nafn viðskiptavinar": "Anna Önnudóttir", "Dagsetning pick-up": "2026-09-19" } },
+];
+
+// Three pending rows: one linked to the first order, one that reaches the
+// second only by its "Order No" text, and one for an order on some other day.
+const PENDING_ROWS = [
+  PENDING_ROW,
+  {
+    id: "recPASS0000000002", createdTime: "2026-09-19T08:05:00.000Z",
+    fields: { "BCBP Raw": "M1ONNUDOTTIR/ANNA EDEF456 KEFCPHFI 0204 262Y002A0002 100", "Order No": "zzzzz", "Passenger Name": "ONNUDOTTIR/ANNA", Flight: "FI 204" },
+  },
+  {
+    id: "recPASS0000000003", createdTime: "2026-09-18T08:00:00.000Z",
+    fields: { "BCBP Raw": "M1OTHER/DAY EGHI789 KEFLHRFI 0450 261Y001A0003 100", "Order No": "yyyyy", "Order No copy": ["recORDER000000077"] },
+  },
+];
+
+function dayStub({ orders = DAY_ORDERS, rows = PENDING_ROWS } = {}) {
+  airtable.reply = (url) => {
+    if (url.includes(`/${ORDERS}?`)) return { status: 200, body: JSON.stringify({ records: orders }) };
+    return { status: 200, body: JSON.stringify({ records: rows }) };
+  };
+}
+
+test("the day's pending passes are joined to its orders through the pickup date", async () => {
+  airtable.reset();
+  dayStub();
+
+  const res = await boot.request("/app/passes/pending?date=2026-09-19", { headers: AUTH });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+
+  assert.equal(body.date, "2026-09-19");
+  assert.equal(body.count, 2, "the other day's pass is not in the answer");
+  assert.deepEqual(body.passes[0], {
+    recordId: "recPASS0000000001",
+    bcbpRaw: RAW,
+    passengerName: "JONSDOTTIR/SIGRIDUR",
+    pnr: "ABC123",
+    flight: "FI 542",
+    flightDate: "2026-09-19",
+    destination: "PRG",
+    orderNumber: "i0lYC",
+    orderRecordId: "recORDER000000001",
+    customerName: "Jón Jónsson",
+    paid: true,
+    pickupDate: "2026-09-19",
+    uthringingarRecordId: "recUTH00000000001",
+    hasLabel: true,
+    createdAt: "2026-09-19T08:00:00.000Z",
+  });
+  // Reached by the "Order No" text alone, so the record id comes from the join.
+  assert.equal(body.passes[1].orderNumber, "zzzzz");
+  assert.equal(body.passes[1].orderRecordId, "recORDER000000002");
+  assert.equal(body.passes[1].paid, false, "unpaid is reported, not hidden");
+  assert.equal(body.passes[1].uthringingarRecordId, null);
+  assert.equal(body.passes[1].hasLabel, false);
+
+  // Orders are READ for the join, with only the fields it needs; the pending
+  // rows are the ones with a pass and no plate.
+  const [orderCall, tagCall] = airtable.calls;
+  assert.ok(orderCall.url.includes(`/${ORDERS}?`));
+  assert.equal(formulaOf(orderCall.url), "IS_SAME({Dagsetning pick-up}, '2026-09-19', 'day')");
+  assert.deepEqual(fieldsOf(orderCall.url), ["Pöntunarnúmer (fx)", "Nafn viðskiptavinar", "Greitt", "Dagsetning pick-up"]);
+  assert.ok(tagCall.url.includes(`/${TAGS}?`));
+  assert.equal(formulaOf(tagCall.url), "AND(LEN({BagTag Number}&'')=0, LEN({BCBP Raw}&'')>0)");
+  assert.ok(fieldsOf(tagCall.url).includes("Úthringingar"));
+  assert.ok(!writes().length, "nothing is ever written by this route");
+});
+
+test("a day with no orders has no pending passes and costs one read", async () => {
+  airtable.reset();
+  dayStub({ orders: [] });
+
+  const body = await (await boot.request("/app/passes/pending?date=2026-09-19", { headers: AUTH })).json();
+  assert.deepEqual(body, { date: "2026-09-19", count: 0, passes: [] });
+  assert.equal(airtable.calls.length, 1);
+});
+
+test("the date defaults to today and must be YYYY-MM-DD", async () => {
+  airtable.reset();
+  dayStub({ orders: [] });
+
+  const today = new Date().toISOString().slice(0, 10);
+  const body = await (await boot.request("/app/passes/pending", { headers: AUTH })).json();
+  assert.equal(body.date, today);
+  assert.ok(formulaOf(airtable.calls[0].url).includes(`'${today}'`));
+
+  const bad = await boot.request("/app/passes/pending?date=19.9.2026", { headers: AUTH });
+  assert.equal(bad.status, 400);
+  assert.deepEqual(await bad.json(), { error: "date must be YYYY-MM-DD" });
+});
+
+test("an Airtable failure on either read is the shared error shape", async () => {
+  airtable.reset();
+  airtable.reply = () => ({ status: 500, body: "upstream is down" });
+
+  const res = await boot.request("/app/passes/pending?date=2026-09-19", { headers: AUTH });
+  assert.equal(res.status, 502);
+  assert.deepEqual(await res.json(), { error: "Airtable request failed" });
+
+  airtable.reset();
+  airtable.reply = () => ({ status: 500, body: "upstream is down" });
+  const scan = await post("/app/passes", SCAN);
+  assert.equal(scan.status, 502);
+  assert.deepEqual(await scan.json(), { error: "Airtable request failed" });
+});
+
+// ---------------------------------------------------------------------------
+// The guard in front of both
+// ---------------------------------------------------------------------------
+
+test("the pass routes sit behind requireAppToken like every other /app route", async () => {
+  airtable.reset();
+
+  const get = await boot.request("/app/passes/pending?date=2026-09-19");
+  assert.equal(get.status, 401);
+  assert.deepEqual(await get.json(), { error: "Unauthorized" });
+
+  const wrong = await post("/app/passes", SCAN, { "x-app-token": "x".repeat(APP_TOKEN.length) });
+  assert.equal(wrong.status, 401);
+  assert.deepEqual(await wrong.json(), { error: "Unauthorized" });
+
+  assert.deepEqual(airtable.calls, [], "an unauthorized request must never reach Airtable");
+});
