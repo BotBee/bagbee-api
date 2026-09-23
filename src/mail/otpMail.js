@@ -98,6 +98,7 @@ export function createMailer({ config, fetchImpl = globalThis.fetch, log = conso
         },
         body: JSON.stringify({
           from: config.OTP_FROM,
+          ...(config.OTP_REPLY_TO ? { reply_to: config.OTP_REPLY_TO } : {}),
           to: Array.isArray(to) ? to : [to],
           subject,
           text,

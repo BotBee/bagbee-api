@@ -128,7 +128,7 @@ test("health mail status: configured needs only RESEND_OTP_API_KEY; log wins whe
     "log",
   );
   // OTP_FROM has a default, so it is never part of "configured".
-  assert.equal(loadConfig(env({ RESEND_OTP_API_KEY: "re_test" })).OTP_FROM, "BagBee <no-reply@bagbee.is>");
+  assert.equal(loadConfig(env({ RESEND_OTP_API_KEY: "re_test" })).OTP_FROM, "BagBee <innskraning@updates.bagbee.is>");
 });
 
 test("dbNetwork names the network, never the URL", () => {

@@ -112,7 +112,11 @@ export function loadConfig(env = process.env) {
 
     // --- mail (§4.6) ---
     RESEND_OTP_API_KEY,
-    OTP_FROM: str(env.OTP_FROM) || "BagBee <no-reply@bagbee.is>",
+    // The verified Resend domain is updates.bagbee.is, a subdomain — Resend
+    // refuses any other sender with a 403 (2026-09-23). The default matches it;
+    // a reply address on the real mailbox is optional.
+    OTP_FROM: str(env.OTP_FROM) || "BagBee <innskraning@updates.bagbee.is>",
+    OTP_REPLY_TO: str(env.OTP_REPLY_TO) || "",
     otpMailTransport,
     mailStatus,
 
