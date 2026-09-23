@@ -15,6 +15,7 @@
 //    carry logHash(OTP_HMAC_SECRET, email), which is useless without the secret (§1.3).
 
 import express from "express";
+import { noteRequestCode } from "../auth/lastRequest.js";
 import { isoSec } from "../time.js";
 import {
   CODE_TTL_SECONDS,
@@ -111,14 +112,22 @@ export function createAuthRoutes({
   /// the allowlist, the code row and the Resend call. A stranger's address and a
   /// driver's therefore cost the same three throttle writes and nothing else.
   async function issueCode({ email, ip, emailHash }) {
-    const person = await roster.findActiveStaffByEmail(email);
+    let person;
+    try {
+      person = await roster.findActiveStaffByEmail(email);
+    } catch (err) {
+      noteRequestCode("failed", `roster lookup: ${err?.code || err?.message || "error"}`);
+      throw err;
+    }
     if (!person) {
+      noteRequestCode("no-match");
       log.log(`[auth] request-code no-match h=${emailHash}`);
       return;
     }
     // Empty allowlist = all Active staff (§2.2). A non-pilot gets the same 200 and
     // no email, which is indistinguishable from an unknown address.
     if (config.staffLoginAllowlist.length && !config.staffLoginAllowlist.includes(person.airtableId)) {
+      noteRequestCode("allowlist", "STAFF_LOGIN_ALLOWLIST is set and does not include this person");
       log.log(`[auth] request-code no-match h=${emailHash}`);
       return;
     }
@@ -147,9 +156,11 @@ export function createAuthRoutes({
     try {
       const { status, providerId } = await mailer.sendOtpMail({ to: email, code, otpId, emailHash });
       await db.query("UPDATE otp_codes SET mail_status = $2, mail_provider_id = $3 WHERE id = $1", [otpId, status, providerId]);
+      noteRequestCode(status === "sent" ? "sent" : status);
       log.log(`[auth] request-code sent h=${emailHash} status=${status}`);
     } catch (err) {
       await db.query("UPDATE otp_codes SET mail_status = 'failed' WHERE id = $1", [otpId]).catch(() => {});
+      noteRequestCode("failed", `mail: ${err?.message || err?.code || "error"}`);
       log.error(`[auth] request-code mail failed h=${emailHash}:`, err?.code || err?.message);
     }
   }

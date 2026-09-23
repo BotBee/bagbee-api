@@ -7,6 +7,7 @@
 // is served as GET /v2/health.
 
 import express from "express";
+import { lastRequestCode } from "../auth/lastRequest.js";
 import { isoSec } from "../time.js";
 import { createMeDeviceRoutes } from "./meDevices.js";
 import { createMeShiftRoutes } from "./meShifts.js";
@@ -80,6 +81,8 @@ export function createV2Router({
       // "invalid" right after deploy instead of at the first real send (§4.4, §7).
       apns: apns().status,
       mail: config.mailStatus,
+      // Why the last code did or did not go out — no address, no code (§4.4).
+      mailLast: lastRequestCode(),
       optimo: config.optimoStatus,
       auth: config.authStatus,
       internal: config.internalStatus,

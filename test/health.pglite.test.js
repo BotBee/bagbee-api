@@ -59,7 +59,7 @@ test("GET /v2/health reports what is configured, never a value", async (t) => {
   const body = await res.json();
 
   assert.deepEqual(Object.keys(body), [
-    "ok", "db", "dbNetwork", "worker", "apns", "mail", "optimo", "auth", "internal", "pushMode",
+    "ok", "db", "dbNetwork", "worker", "apns", "mail", "mailLast", "optimo", "auth", "internal", "pushMode",
   ]);
   assert.equal(body.ok, true);
   assert.equal(body.db, "ready");
