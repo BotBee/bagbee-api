@@ -43,12 +43,15 @@ function writeCall() {
 }
 
 /// Airtable answers the tag lookup with `existing` (or nothing), and accepts the
-/// write that follows.
-function tagUpsertStub(existing) {
+/// write that follows. A tag that names its order by number only also costs one
+/// read on Orders (2026-09-25); here that finds no such order unless a test
+/// says otherwise, so the tag record is never mistaken for an order.
+function tagUpsertStub(existing, { orders = [] } = {}) {
   airtable.reply = (url, options = {}) => {
     if (options.method === "PATCH" || options.method === "POST") {
       return { status: 200, body: JSON.stringify({ id: existing?.id || "recTAGnew00000000" }) };
     }
+    if (url.includes(`/${ORDERS}?`)) return { status: 200, body: JSON.stringify({ records: orders }) };
     return { status: 200, body: JSON.stringify({ records: existing ? [existing] : [] }) };
   };
 }

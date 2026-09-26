@@ -82,9 +82,10 @@ function writes() {
 }
 
 /// The tag table, answered by formula: `byTag` for the plate lookup /app/tags
-/// makes first, `byRaw` for the pass lookup, and writes accepted with the id
-/// they were addressed to.
-function tagTableStub({ byTag = [], byRaw = [] } = {}) {
+/// makes first, `byRaw` for the pass lookup, `orders` for the one read on
+/// Orders that turns a number into its record id (2026-09-25), and writes
+/// accepted with the id they were addressed to.
+function tagTableStub({ byTag = [], byRaw = [], orders = [] } = {}) {
   airtable.reply = (url, options = {}) => {
     if (options.method === "PATCH") {
       return { status: 200, body: JSON.stringify({ id: url.split("/").pop() }) };
@@ -95,6 +96,7 @@ function tagTableStub({ byTag = [], byRaw = [] } = {}) {
     const formula = formulaOf(url);
     if (formula.startsWith("{BagTag Number}=")) return { status: 200, body: JSON.stringify({ records: byTag }) };
     if (formula.startsWith("{BCBP Raw}=")) return { status: 200, body: JSON.stringify({ records: byRaw }) };
+    if (formula.startsWith("{Pöntunarnúmer (fx)}=")) return { status: 200, body: JSON.stringify({ records: orders }) };
     return { status: 200, body: JSON.stringify({ records: [] }) };
   };
 }
@@ -318,8 +320,11 @@ test("the oldest pending row for a pass is the one filled", async () => {
 
 test("a tag already known by its number never looks at the pass — the old path, byte for byte", async () => {
   airtable.reset();
+  // A complete row — both order halves — so there is nothing to derive either.
   tagTableStub({
-    byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No": "i0lYC", "BCBP Raw": RAW } }],
+    byTag: [{ id: "recTAG00000000001", fields: {
+      "BagTag Number": "0592123456", "Order No": "i0lYC", "Order No copy": ["recORDER0000i0lYC"], "BCBP Raw": RAW,
+    } }],
     byRaw: [PENDING_ROW],
   });
 
@@ -358,8 +363,11 @@ test("a claim without a pass makes no pass lookup at all", async () => {
   tagTableStub();
 
   await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC" });
+  // Two reads, neither of them for a pass: the plate lookup, and (since
+  // 2026-09-25) the one read on Orders that turns the number into its link.
   const reads = airtable.calls.filter((c) => !c.options.method || c.options.method === "GET");
-  assert.equal(reads.length, 1);
+  assert.ok(!reads.some((c) => formulaOf(c.url).startsWith("{BCBP Raw}=")), "no pass lookup");
+  assert.equal(reads.filter((c) => c.url.includes(TAGS)).length, 1, "one lookup of the tag table");
   assert.equal(writes()[0].method, "POST");
 });
 
@@ -537,6 +545,204 @@ test("an Airtable failure on either read is the shared error shape", async () =>
   const scan = await post("/app/passes", SCAN);
   assert.equal(scan.status, 502);
   assert.deepEqual(await scan.json(), { error: "Airtable request failed" });
+});
+
+// ---------------------------------------------------------------------------
+// "Order No" and "Order No copy" are one fact, written twice (2026-09-25)
+// ---------------------------------------------------------------------------
+//
+// The number is the last five characters of the Orders record id, so either
+// half yields the other: the text from the id for free, the id from the text
+// with one READ on Orders. On 2026-09-25 fourteen rows claimed from the Mac had
+// the link and no text, and nine rows from the phone the text and no link.
+// Both are closed here — for a new row, for a row that already exists with one
+// half, for the pending row a claim fills, and for POST /app/passes.
+
+const ORDER_ID = "recORDER0000i0lYC";   // ends in the order number, as every real one does
+const ORDER_ROW = { id: ORDER_ID, fields: { "Pöntunarnúmer (fx)": "i0lYC" } };
+const isOrdersRead = (c) => c.url.includes(`/${ORDERS}?`);
+const readCalls = () => airtable.calls.filter((c) => !c.options.method || c.options.method === "GET");
+
+test("a record id alone yields the text — no lookup, and nothing invented from a bad id", async () => {
+  airtable.reset();
+  tagTableStub();
+  await post("/app/tags", { tagNumber: "0592123456", orderRecordId: ORDER_ID });
+  let fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID]);
+  assert.ok(!readCalls().some(isOrdersRead), "the number is in the id; Orders is not asked");
+
+  // A value that is not a record id derives nothing: the text is not made up.
+  airtable.reset();
+  tagTableStub();
+  await post("/app/tags", { tagNumber: "0592123456", orderRecordId: "not-a-record-id" });
+  fields = writes()[0].body.fields;
+  assert.ok(!("Order No" in fields));
+  assert.ok(!readCalls().some(isOrdersRead));
+});
+
+test("a number alone resolves the link with ONE read on Orders — a read, never a write", async () => {
+  airtable.reset();
+  tagTableStub({ orders: [ORDER_ROW] });
+  const res = await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC", passengerName: "JONSDOTTIR/SIGRIDUR" });
+  assert.equal(res.status, 200);
+
+  const asks = readCalls().filter(isOrdersRead);
+  assert.equal(asks.length, 1, "one read on Orders");
+  assert.equal(formulaOf(asks[0].url), "{Pöntunarnúmer (fx)}='i0lYC'");
+  assert.deepEqual(fieldsOf(asks[0].url), ["Pöntunarnúmer (fx)"], "the number field only, not the whole row");
+  assert.equal(new URL(asks[0].url).searchParams.get("maxRecords"), "1");
+
+  const [write] = writes();
+  assert.equal(write.method, "POST");
+  assert.ok(write.url.includes(TAGS));
+  assert.equal(write.body.fields["Order No"], "i0lYC");
+  assert.deepEqual(write.body.fields["Order No copy"], [ORDER_ID]);
+  assert.ok(!writes().some((w) => w.url.includes(ORDERS)), "Orders is never written to");
+});
+
+test("a number with no such order keeps the text and simply has no link", async () => {
+  airtable.reset();
+  tagTableStub({ orders: [] });
+  const res = await post("/app/tags", { tagNumber: "0592123456", orderNumber: "zzzzz" });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).created, true);
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "zzzzz");
+  assert.ok(!("Order No copy" in fields));
+});
+
+test("an Orders read that fails costs the link, never the tag", async () => {
+  airtable.reset();
+  tagTableStub();
+  const inner = airtable.reply;
+  airtable.reply = (url, options) => (isOrdersRead({ url }) ? { status: 500, body: "orders is down" } : inner(url, options));
+
+  const res = await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC" });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).created, true);
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["BagTag Number"], "0592123456");
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.ok(!("Order No copy" in fields));
+});
+
+test("both halves sent is the old path: no Orders read at all", async () => {
+  airtable.reset();
+  tagTableStub();
+  await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC", orderRecordId: ORDER_ID });
+  assert.ok(!readCalls().some(isOrdersRead));
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID]);
+});
+
+test("a row with the link and no text gains the text from its own link, whatever the request brought", async () => {
+  // The Mac's fourteen rows of 2026-09-25: linked to the order, "Order No" blank.
+  airtable.reset();
+  tagTableStub({ byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No copy": [ORDER_ID] } }] });
+
+  const res = await post("/app/tags", { tagNumber: "0592123456", zpl: REAL_ZPL });
+  assert.equal((await res.json()).updated, true);
+  const [write] = writes();
+  assert.equal(write.method, "PATCH");
+  assert.equal(write.body.fields["Order No"], "i0lYC");
+  assert.ok(!("Order No copy" in write.body.fields), "the link it has is left alone");
+  assert.ok(!readCalls().some(isOrdersRead), "the number is in the link; Orders is not asked");
+});
+
+test("a row with the text and no link gains the link with one read, whatever the request brought", async () => {
+  // The phone's nine rows of 2026-09-25: "Order No" filled, no link.
+  airtable.reset();
+  tagTableStub({
+    byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No": "i0lYC" } }],
+    orders: [ORDER_ROW],
+  });
+
+  const res = await post("/app/tags", { tagNumber: "0592123456", passengerName: "JONSDOTTIR/SIGRIDUR" });
+  assert.equal((await res.json()).updated, true);
+  const [write] = writes();
+  assert.equal(write.method, "PATCH");
+  assert.deepEqual(write.body.fields["Order No copy"], [ORDER_ID]);
+  assert.ok(!("Order No" in write.body.fields), "the text it has is left alone");
+  assert.equal(readCalls().filter(isOrdersRead).length, 1);
+});
+
+test("a re-sent tag whose row is already complete costs no Orders read and no write", async () => {
+  // The phone re-sends after a dropped connection, number only. The id is on
+  // the row already, so nothing is asked and nothing is written.
+  airtable.reset();
+  tagTableStub({
+    byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No": "i0lYC", "Order No copy": [ORDER_ID] } }],
+  });
+  const body = await (await post("/app/tags", { tagNumber: "0592123456", orderNumber: "i0lYC" })).json();
+  assert.deepEqual(body, { id: "recTAG00000000001", created: false, updated: false, label: "none", tagData: "none" });
+  assert.equal(readCalls().length, 1, "the plate lookup only");
+  assert.deepEqual(writes(), []);
+});
+
+test("the request's order comes first; the row's own halves complete only what the request left", async () => {
+  // Linked to one order with no text; the request names ANOTHER order by number.
+  // The text is the request's (fill-blanks, as ever) and its link is appended;
+  // the row's link is not turned into a competing text.
+  airtable.reset();
+  tagTableStub({
+    byTag: [{ id: "recTAG00000000001", fields: { "BagTag Number": "0592123456", "Order No copy": [ORDER_ID] } }],
+    orders: [{ id: "recORDER0000zzzzz", fields: { "Pöntunarnúmer (fx)": "zzzzz" } }],
+  });
+  await post("/app/tags", { tagNumber: "0592123456", orderNumber: "zzzzz" });
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "zzzzz");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID, "recORDER0000zzzzz"]);
+});
+
+test("a claim that fills a pending row completes the row's order too", async () => {
+  // The scan got through with the number only; the claim brings the plate and the pass.
+  airtable.reset();
+  tagTableStub({
+    byRaw: [{ id: "recPASS0000000001", fields: { "BCBP Raw": RAW, "Order No": "i0lYC" } }],
+    orders: [ORDER_ROW],
+  });
+  const body = await (await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW })).json();
+  assert.equal(body.filledPending, true);
+  const fields = writes()[0].body.fields;
+  assert.equal(fields["BagTag Number"], "0592123456");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID]);
+  assert.equal(readCalls().filter(isOrdersRead).length, 1);
+});
+
+test("POST /app/passes completes the pair the same way, new row and pending row alike", async () => {
+  // A scan with the record id only: the text is derived, nothing is asked.
+  airtable.reset();
+  tagTableStub();
+  const { orderNumber: _n, ...withIdOnly } = SCAN;
+  await post("/app/passes", { ...withIdOnly, orderRecordId: ORDER_ID });
+  let fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID]);
+  assert.ok(!readCalls().some(isOrdersRead));
+
+  // A scan with the number only: one read, and the link lands.
+  airtable.reset();
+  tagTableStub({ orders: [ORDER_ROW] });
+  const { orderRecordId: _r, ...withNumberOnly } = SCAN;
+  await post("/app/passes", withNumberOnly);
+  fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.deepEqual(fields["Order No copy"], [ORDER_ID]);
+  assert.equal(readCalls().filter(isOrdersRead).length, 1);
+
+  // A pending row with the link only, scanned again by a phone that sends
+  // nothing about the order: the text is filled from the row's own link.
+  airtable.reset();
+  tagTableStub({ byRaw: [{ id: "recPASS0000000001", fields: { "BCBP Raw": RAW, "Order No copy": [ORDER_ID] } }] });
+  const body = await (await post("/app/passes", { bcbpRaw: RAW })).json();
+  assert.equal(body.updated, true);
+  fields = writes()[0].body.fields;
+  assert.equal(fields["Order No"], "i0lYC");
+  assert.ok(!("Order No copy" in fields));
+  assert.ok(!readCalls().some(isOrdersRead));
+  assert.ok(!writes().some((w) => w.url.includes(ORDERS)), "Orders is never written to");
 });
 
 // ---------------------------------------------------------------------------

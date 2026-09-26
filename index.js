@@ -138,6 +138,10 @@ function escapeFormulaValue(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 }
 
+/// An Airtable record id. An order's `Pöntunarnúmer (fx)` is RIGHT(RECORD_ID(), 5)
+/// and a bag tag number is all digits, so neither can be mistaken for one.
+const AIRTABLE_RECORD_ID = /^rec[A-Za-z0-9]{14}$/;
+
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -165,6 +169,102 @@ app.get("/app/orders/today", requireAppToken, async (req, res) => {
 });
 
 const STOPS_TABLE = "tblE3fYDSuk7dKPdF";          // Optimo Stops
+
+// ---------------------------------------------------------------------------
+// The two order fields of a Tag numbers row
+// ---------------------------------------------------------------------------
+//
+// A row names its order twice: "Order No", the 5-character number as text, and
+// "Order No copy", the link to the Orders record. They are ONE fact — the number
+// is the last five characters of the record id (`Pöntunarnúmer (fx)` is
+// RIGHT(RECORD_ID(), 5)) — but the readers of the table each need a different
+// half: GET /app/orders/:orderRef/tags matches on either, the check-in
+// confirmation and a person in Airtable read the text, Airtable's own lookups
+// follow the link. Until 2026-09-25 every caller wrote the half it happened to
+// hold: the Mac, which had resolved the record id, left the text blank (14 rows
+// that day) and the phone, which knows the number, left the link blank (9). So
+// every write here completes the pair from whichever half it has — the text
+// from the id with no lookup at all, the id from the text with ONE read on
+// Orders. Orders is never written to.
+
+const ORDER_NUMBER_LENGTH = 5;
+
+/// The order number an Orders record id carries in its tail, or null when the
+/// value is not a record id at all — nothing is invented from a bad link.
+function orderNumberFromRecordId(recordId) {
+  const id = String(recordId || "").trim();
+  return AIRTABLE_RECORD_ID.test(id) ? id.slice(-ORDER_NUMBER_LENGTH) : null;
+}
+
+/// The Orders record id behind a number, or null when there is no such order.
+/// One read, asking for the number field only so the row's width is not paid
+/// for. READ ONLY.
+async function orderRecordIdFromNumber(orderNumber) {
+  const number = String(orderNumber || "").trim();
+  if (!number) return null;
+  const found = await airtableFetch(
+    `${airtableURL(AIRTABLE_TABLE)}?${new URLSearchParams([
+      ["filterByFormula", `{Pöntunarnúmer (fx)}='${escapeFormulaValue(number)}'`],
+      ["maxRecords", "1"],
+      ["fields[]", "Pöntunarnúmer (fx)"],
+    ])}`
+  );
+  return (found.records || [])[0]?.id || null;
+}
+
+/// The order a request names, both halves, from whichever it brought.
+///
+/// `{ number, recordId }`, either null when it is neither known nor derivable.
+/// When the request has the number only and the row it is about to update is
+/// already linked to that very order, the id is read off the row: a phone that
+/// re-sends a tag whose row is complete costs no Orders read. The read, when it
+/// is needed, never fails the request — a tag row with a text order is worth
+/// more than its link, and a claim must not be lost to a slow Orders table.
+async function orderIdentity(b, existing, what) {
+  let number = String(b.orderNumber || "").trim();
+  let recordId = String(b.orderRecordId || "").trim();
+  if (recordId && !number) number = orderNumberFromRecordId(recordId) || "";
+  if (number && !recordId && existing) {
+    recordId = (existing.fields?.["Order No copy"] || [])
+      .find((id) => orderNumberFromRecordId(id) === number) || "";
+  }
+  if (number && !recordId) {
+    try {
+      recordId = (await orderRecordIdFromNumber(number)) || "";
+      if (!recordId) console.warn(`[${what}] order ${number}: no such order — text stored, no link`);
+    } catch (err) {
+      console.warn(`[${what}] order ${number}: record id not resolved (${err.message}) — text stored, no link`);
+    }
+  }
+  return { number: number || null, recordId: recordId || null };
+}
+
+/// The order fields to write on an existing row, given the order the request
+/// names (`orderIdentity`). The request's text is filled in by the caller's
+/// fill-blanks loop; this appends its link, as before, and then turns the same
+/// fill-blanks rule on the row's OWN two cells, so a row that arrived here with
+/// one half gains the other whatever the request brought — the request's order
+/// first when it has one, the row's when it has not.
+async function orderFieldsForRow(existing, order, what) {
+  const fields = {};
+  const cur = existing.fields || {};
+  const links = Array.isArray(cur["Order No copy"]) ? cur["Order No copy"] : [];
+  const textBlank = isBlankCell(cur["Order No"]);
+
+  // The link is a list, so "already linked" means the order is in it.
+  if (order.recordId && !links.includes(order.recordId)) {
+    fields["Order No copy"] = [...links, order.recordId];
+  }
+  if (textBlank && !order.number && links.length) {
+    const number = orderNumberFromRecordId(links[0]);
+    if (number) fields["Order No"] = number;
+  }
+  if (!links.length && !order.recordId && !textBlank) {
+    const { recordId } = await orderIdentity({ orderNumber: cur["Order No"] }, null, what);
+    if (recordId) fields["Order No copy"] = [recordId];
+  }
+  return fields;
+}
 
 /// Records a bag tag issued by BagChain against its order.
 ///
@@ -196,7 +296,6 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
     if (v !== undefined && v !== null && v !== "") incoming[field] = v;
   };
   put("BagTag Number", tagNumber);
-  put("Order No", b.orderNumber);
   put("Passenger Name", b.passengerName);
   put("PNR", b.pnr);
   put("Flight", b.flight);
@@ -232,6 +331,11 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       pendingFill = Boolean(existing);
       if (pendingFill) console.log(`[tags] ${tagNumber}: filling the pending pass row ${existing.id}`);
     }
+
+    // Both halves of the order, from whichever the caller sent (see
+    // orderIdentity). Filled under the same rules as every other field.
+    const order = await orderIdentity(b, existing, "tags");
+    put("Order No", order.number);
 
     if (existing) {
       const fields = {};
@@ -306,11 +410,7 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
         }
       }
 
-      // The link is a list, so "already linked" means the order is in it.
-      const links = existing.fields["Order No copy"] || [];
-      if (b.orderRecordId && !links.includes(b.orderRecordId)) {
-        fields["Order No copy"] = [...links, b.orderRecordId];
-      }
+      Object.assign(fields, await orderFieldsForRow(existing, order, "tags"));
       // A tag claimed from a boarding pass has no order — a BCBP carries a PNR,
       // not an order number, and nothing in the base joins the two. It links to
       // the Úthringingar passenger row the check-in run worked from instead.
@@ -336,7 +436,7 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
       });
     }
 
-    if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
+    if (order.recordId) incoming["Order No copy"] = [order.recordId];
     if (b.uthringingarRecordId) incoming["Úthringingar"] = [b.uthringingarRecordId];
     if (label.status === "ok") incoming["Label ZPL"] = label.value;
     if (tagData.status === "ok") incoming["Tag data"] = tagData.value;
@@ -494,7 +594,6 @@ app.post("/app/passes", requireAppToken, async (req, res) => {
     const v = typeof value === "string" ? value.trim() : value;
     if (v !== undefined && v !== null && v !== "") incoming[field] = v;
   };
-  put("Order No", b.orderNumber);
   put("Passenger Name", b.passengerName);
   put("PNR", b.pnr);
   put("Flight", b.flight);
@@ -510,6 +609,10 @@ app.post("/app/passes", requireAppToken, async (req, res) => {
     const claimedTags = claimed.map((r) => String(r.fields["BagTag Number"]).trim());
     const existing = pending[0];
 
+    // Both halves of the order, from whichever the scan managed to send.
+    const order = await orderIdentity(b, existing, "passes");
+    put("Order No", order.number);
+
     if (existing) {
       const fields = {};
       for (const [key, value] of Object.entries(incoming)) {
@@ -524,10 +627,7 @@ app.post("/app/passes", requireAppToken, async (req, res) => {
         fields["Label ZPL"] = label.value;
         labelStatus = "stored";
       }
-      const links = existing.fields["Order No copy"] || [];
-      if (b.orderRecordId && !links.includes(b.orderRecordId)) {
-        fields["Order No copy"] = [...links, b.orderRecordId];
-      }
+      Object.assign(fields, await orderFieldsForRow(existing, order, "passes"));
       const uth = existing.fields["Úthringingar"] || [];
       if (b.uthringingarRecordId && !uth.includes(b.uthringingarRecordId)) {
         fields["Úthringingar"] = [...uth, b.uthringingarRecordId];
@@ -549,7 +649,7 @@ app.post("/app/passes", requireAppToken, async (req, res) => {
       });
     }
 
-    if (b.orderRecordId) incoming["Order No copy"] = [b.orderRecordId];
+    if (order.recordId) incoming["Order No copy"] = [order.recordId];
     if (b.uthringingarRecordId) incoming["Úthringingar"] = [b.uthringingarRecordId];
     if (label.status === "ok") incoming["Label ZPL"] = label.value;
     const created = await airtableFetch(airtableURL(TAG_TABLE), {
@@ -919,10 +1019,6 @@ app.get("/app/tags/find", requireAppToken, async (req, res) => {
     sendAirtableError(res, err, "tags/find");
   }
 });
-
-/// An Airtable record id. An order's `Pöntunarnúmer (fx)` is RIGHT(RECORD_ID(), 5)
-/// and a bag tag number is all digits, so neither can be mistaken for one.
-const AIRTABLE_RECORD_ID = /^rec[A-Za-z0-9]{14}$/;
 
 /// Whether a failed single-record GET means the record simply isn't there.
 ///
