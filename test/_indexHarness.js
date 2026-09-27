@@ -56,7 +56,18 @@ export function installHooks() {
 
   globalThis.__bagbeeTestFetch = async (url, options = {}) => {
     airtable.calls.push({ url: String(url), options });
-    const { status = 200, body = "" } = (await airtable.reply(String(url), options)) || {};
+    // An `options.signal` aborts the stubbed call the way node-fetch would, so a
+    // route's own timeout can be exercised with a `reply` that never answers.
+    const answer = Promise.resolve().then(() => airtable.reply(String(url), options));
+    const { signal } = options;
+    const abortError = () => Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    const raced = signal
+      ? Promise.race([answer, new Promise((_, reject) => {
+          if (signal.aborted) reject(abortError());
+          else signal.addEventListener("abort", () => reject(abortError()), { once: true });
+        })])
+      : answer;
+    const { status = 200, body = "" } = (await raced) || {};
     return {
       ok: status >= 200 && status < 300,
       status,

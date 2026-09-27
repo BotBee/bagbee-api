@@ -50,9 +50,33 @@ const FAST_TRACK_TABLE = "tblBjNPgtuxYD3hFd";      // Fast Track
 const AIRTABLE_TOKEN = process.env.AIRTABLE_TOKEN;
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <onboarding@resend.dev>";
+// Activation requests go to a real airline handler, so they must come from a
+// BagBee address. Resend will only sign for a domain it has verified: the intended
+// sender is the company mailbox itself, and until bagbee.is carries Resend's
+// records the route falls back to the subdomain that already does
+// (updates.bagbee.is, verified 2026-09-25), with replies pointed at the real
+// mailbox either way. The old default, Resend's onboarding@resend.dev test
+// sender, may only mail the account owner — every request to an airline address
+// since 2026-05-08 was refused with 403 (found 2026-09-27).
+const ACTIVATION_FROM = process.env.ACTIVATION_FROM || "BagBee <bagbee@bagbee.is>";
+const ACTIVATION_FALLBACK_FROM = process.env.ACTIVATION_FALLBACK_FROM ?? "BagBee <bagbee@updates.bagbee.is>";
+const ACTIVATION_REPLY_TO = process.env.ACTIVATION_REPLY_TO ?? "bagbee@bagbee.is";
 const ACTIVATION_TO = process.env.ACTIVATION_TO || "pax@airportassociates.com";
 const ACTIVATION_CC = process.env.ACTIVATION_CC || "bagbee@bagbee.is";
+// A working BagBee sender is also a working relay, so `to` is a choice within this
+// list (the two handlers the phone offers, plus our own mailbox for a test send),
+// never a free recipient, and a tag number is letters, digits and dashes only —
+// nothing that could carry HTML or a second header into the mail.
+const ACTIVATION_RECIPIENTS = new Set(
+  (process.env.ACTIVATION_RECIPIENTS || "pax@airportassociates.com,paxservicemanagerskef@icelandair.is,bagbee@bagbee.is")
+    .split(",").map((a) => a.trim().toLowerCase()).filter(Boolean),
+);
+ACTIVATION_RECIPIENTS.add(ACTIVATION_TO.trim().toLowerCase());
+const ACTIVATION_TAG_RX = /^[A-Za-z0-9-]{1,32}$/;
+const ACTIVATION_MAX_TAGS = 200;
+// The phone gives up after 30 s; two attempts must answer inside that, so the
+// driver sees a real reason instead of a timeout and a tempting retap.
+const ACTIVATION_SEND_TIMEOUT_MS = Number(process.env.ACTIVATION_SEND_TIMEOUT_MS) || 10_000;
 
 // Shared secret the iOS app sends as `x-app-token`. Set in Railway.
 const APP_TOKEN = process.env.APP_TOKEN;
@@ -1459,11 +1483,89 @@ app.get("/order/:recordId", async (req, res) => {
   }
 });
 
+/// One Resend call inside one time budget. Read as text and parse by hand: node-fetch
+/// and the test harness's stub both offer text(), and a non-JSON body must not turn a
+/// clear provider refusal into a TypeError. A timeout comes back as status 0, so the
+/// caller can tell "no answer" from "refused" and never retries a send that may in
+/// fact have been accepted.
+async function resendSend(payload, idempotencyKey) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ACTIVATION_SEND_TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    const timedOut = err?.name === "AbortError";
+    return {
+      ok: false,
+      status: 0,
+      result: { message: timedOut ? `Resend did not answer within ${ACTIVATION_SEND_TIMEOUT_MS / 1000} s` : `Resend unreachable: ${err?.message || err}` },
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+  const raw = await r.text();
+  let result;
+  try {
+    result = raw ? JSON.parse(raw) : {};
+  } catch {
+    result = { message: raw.slice(0, 300) };
+  }
+  return { ok: r.ok, status: r.status, result };
+}
+
+/// The same tags to the same handler from the same sender inside the same ten
+/// minutes is one request, however many times it is tapped: a retap after an
+/// ambiguous failure gets Resend's original answer back instead of a second mail.
+/// The sender is part of the key because the fallback attempt carries a different
+/// payload, and Resend rejects a reused key whose payload differs.
+function activationIdempotencyKey(from, recipient, tagNumbers) {
+  const bucket = Math.floor(Date.now() / 600_000);
+  const digest = crypto.createHash("sha256")
+    .update([from, recipient.toLowerCase(), [...tagNumbers].sort().join(","), bucket].join("|"))
+    .digest("hex");
+  return `activation-${digest}`;
+}
+
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+/// Resend refuses a sender it cannot sign for with 403 and a message naming the
+/// domain ("The bagbee.is domain is not verified…", or for its own test sender
+/// "You can only send testing emails to your own email address…"). Only that
+/// class of refusal is worth a second attempt from another address; a bad
+/// recipient or a bad key fails the same way from any sender.
+function senderRefused({ status, result }) {
+  if (status === 403) return true;
+  const message = String(result?.message || "");
+  return status >= 400 && status < 500 && /domain|verif|from address|sender/i.test(message);
+}
+
 app.post("/send-activation-request", requireAppToken, async (req, res) => {
   const { tagNumbers, to } = req.body || {};
 
   if (!Array.isArray(tagNumbers) || tagNumbers.length === 0) {
     return res.status(400).json({ error: "tagNumbers must be a non-empty array" });
+  }
+  if (tagNumbers.length > ACTIVATION_MAX_TAGS) {
+    return res.status(400).json({ error: `at most ${ACTIVATION_MAX_TAGS} tags per request` });
+  }
+  if (!tagNumbers.every((t) => typeof t === "string" && ACTIVATION_TAG_RX.test(t))) {
+    return res.status(400).json({ error: "every tag number must be 1-32 letters, digits or dashes" });
+  }
+
+  const recipient = (typeof to === "string" && to.trim()) || ACTIVATION_TO;
+  if (!ACTIVATION_RECIPIENTS.has(recipient.toLowerCase())) {
+    console.warn(`[activation] refused recipient outside the handler list${req.staff ? ` (staff ${req.staff.id ?? req.staff.sub ?? "?"})` : ""}`);
+    return res.status(400).json({ error: "recipient is not one of the airline handlers this mail may go to" });
   }
 
   if (!RESEND_API_KEY) {
@@ -1471,41 +1573,44 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
     return res.status(500).json({ error: "Email service not configured" });
   }
 
-  const recipient = (typeof to === "string" && to.trim()) || ACTIVATION_TO;
-
   const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
   const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
   const html = `
     <p>Please activate these inactive bag tags:</p>
-    <ul>${tagNumbers.map((t) => `<li><code>${t}</code></li>`).join("")}</ul>
+    <ul>${tagNumbers.map((t) => `<li><code>${escapeHtml(t)}</code></li>`).join("")}</ul>
   `;
+  const message = {
+    to: [recipient],
+    cc: ACTIVATION_CC ? [ACTIVATION_CC] : undefined,
+    reply_to: ACTIVATION_REPLY_TO || undefined,
+    subject: `Inactive bag tags — please activate (${tagNumbers.length})`,
+    text,
+    html,
+  };
 
   try {
-    const r = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${RESEND_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        from: ACTIVATION_FROM,
-        to: [recipient],
-        cc: ACTIVATION_CC ? [ACTIVATION_CC] : undefined,
-        subject: `Inactive bag tags — please activate (${tagNumbers.length})`,
-        text,
-        html,
-      }),
-    });
+    let from = ACTIVATION_FROM;
+    let attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
 
-    const result = await r.json();
-
-    if (!r.ok) {
-      console.error("[activation] Resend error:", r.status, result);
-      return res.status(500).json({ error: "Failed to send email", detail: result });
+    if (!attempt.ok && ACTIVATION_FALLBACK_FROM && ACTIVATION_FALLBACK_FROM !== ACTIVATION_FROM && senderRefused(attempt)) {
+      console.warn(
+        `[activation] Resend refused sender ${ACTIVATION_FROM} (${attempt.status}: ${attempt.result?.message || "no message"}); ` +
+        `retrying from ${ACTIVATION_FALLBACK_FROM}`,
+      );
+      from = ACTIVATION_FALLBACK_FROM;
+      attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
     }
 
-    console.log(`[activation] sent ${tagNumbers.length} tags to ${recipient} (cc ${ACTIVATION_CC || "none"}), id=${result.id}`);
-    res.json({ ok: true, count: tagNumbers.length, id: result.id });
+    if (!attempt.ok) {
+      console.error("[activation] Resend error:", attempt.status, attempt.result);
+      return res.status(500).json({ error: "Failed to send email", detail: attempt.result });
+    }
+
+    console.log(
+      `[activation] sent ${tagNumbers.length} tags to ${recipient} from ${from} ` +
+      `(cc ${ACTIVATION_CC || "none"}, reply-to ${ACTIVATION_REPLY_TO || "none"}), id=${attempt.result.id}`,
+    );
+    res.json({ ok: true, count: tagNumbers.length, id: attempt.result.id, from });
   } catch (err) {
     console.error("[activation] send failed:", err);
     res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });
