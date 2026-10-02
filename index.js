@@ -989,27 +989,53 @@ app.get("/app/orders/upcoming", requireAppToken, async (req, res) => {
   }
 });
 
+/// Paid orders matching `q` on customer name, pickup address, delivery address
+/// or order number, most recent pickup first.
+///
+/// `from`/`to` (YYYY-MM-DD, inclusive, either or both) limit the pickup day —
+/// Dagurinn widens its search to the week around the day on screen. Like
+/// /app/orders/day they are matched against a strict pattern before they reach
+/// the formula. An undated order cannot sit inside a window, so a window also
+/// drops those.
 app.get("/app/orders/search", requireAppToken, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   if (!q) return res.status(400).json({ error: "q is required" });
 
+  const from = (req.query.from || "").toString().trim();
+  const to = (req.query.to || "").toString().trim();
+  for (const [name, value] of [["from", from], ["to", to]]) {
+    if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
+    }
+  }
+
   // `upcoming=1` drops orders whose pickup has passed. Opt-in, so the older
   // callers of this endpoint keep searching the full history.
   const upcomingOnly = req.query.upcoming === "1";
-  const dateClause = upcomingOnly
-    ? `, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}'))`
-    : "";
+  const dateClauses = [];
+  if (upcomingOnly || from || to) dateClauses.push("{Dagsetning pick-up}");
+  if (upcomingOnly) dateClauses.push(`NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}'))`);
+  if (from) dateClauses.push(`NOT(IS_BEFORE({Dagsetning pick-up}, '${from}'))`);
+  if (to) dateClauses.push(`NOT(IS_AFTER({Dagsetning pick-up}, '${to}'))`);
+  const dateClause = dateClauses.map((c) => `, ${c}`).join("");
 
+  // Heimilisfang is the pickup address — what Dagurinn shows on a stop, so
+  // what a driver types.
   const safe = escapeFormulaValue(q.toLowerCase());
   const formula = `AND({Greitt}${dateClause}, OR(` +
     `FIND('${safe}', LOWER({Nafn viðskiptavinar})),` +
+    `FIND('${safe}', LOWER({Heimilisfang})),` +
     `FIND('${safe}', LOWER({Delivery Address})),` +
     `FIND('${safe}', LOWER({Pöntunarnúmer (fx)}))` +
     `))`;
-  const url = `${airtableURL(AIRTABLE_TABLE)}?filterByFormula=${encodeURIComponent(formula)}&maxRecords=100`;
+  const params = new URLSearchParams({ filterByFormula: formula, maxRecords: "100" });
+  // Newest first, so a search of the whole history spends the 100-row cap on
+  // the orders a driver is likely to mean.
+  params.set("sort[0][field]", "Dagsetning pick-up");
+  params.set("sort[0][direction]", "desc");
 
   try {
-    res.json(await airtableFetch(url));
+    res.json(await airtableFetch(`${airtableURL(AIRTABLE_TABLE)}?${params}`));
   } catch (err) {
     sendAirtableError(res, err, "orders/search");
   }
