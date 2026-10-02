@@ -303,6 +303,7 @@ test("the tag list is reachable by the 5-char order number", async () => {
     destination: "PRG",
     delivered: true,
     hasLabel: true,
+    hasPhoto: false,
     createdAt: "2026-09-18T09:00:00.000Z",
     // Since 2026-09-19 (fallback passes): a claimed tag is not pending, and
     // this row never stored the pass it was issued for.
@@ -311,6 +312,11 @@ test("the tag list is reachable by the 5-char order number", async () => {
   });
   assert.equal(body.tags[1].hasLabel, false, "a tag with no label says so");
   assert.equal(body.tags[1].delivered, false);
+
+  // The photo cell is asked for, so the list can say which tags have one — and
+  // only the yes/no leaves the backend.
+  const tagCall = airtable.calls.find((c) => c.url.includes(TAGS));
+  assert.ok(new URL(tagCall.url).searchParams.getAll("fields[]").includes("Attachments"));
 
   // The label itself is not in the list — a 32-bag group would be 65 kB.
   assert.ok(body.tags.every((t) => !("zpl" in t) && !("_zpl" in t)));
@@ -355,6 +361,21 @@ test("?labels=1 embeds the labels, for pre-loading a day before driving out", as
   assert.equal(body.tags[0].zpl, ZPL);
   assert.equal(body.tags[1].zpl, null, "no label stored is null, not an empty string");
   assert.ok(body.tags.every((t) => !("_zpl" in t)));
+});
+
+test("a tag that already has a delivery photo says so, and the photo stays behind", async () => {
+  // Build 47 review, 2026-10-02: a photo linked by hand REPLACES the tag's
+  // Attachments, so the phone has to know which tags already have one.
+  airtable.reset();
+  const photographed = {
+    ...TAG_BY_LINK,
+    fields: { ...TAG_BY_LINK.fields, Attachments: [{ id: "attPHOTO000000001", url: "https://r2.example/bag.jpg" }] },
+  };
+  orderWithTagsStub({ tags: [TAG_BY_TEXT, photographed] });
+
+  const body = await (await boot.request("/app/orders/i0lYC/tags", { headers: AUTH })).json();
+  assert.deepEqual(body.tags.map((t) => t.hasPhoto), [false, true]);
+  assert.ok(body.tags.every((t) => !("Attachments" in t) && !("attachments" in t)));
 });
 
 test("an order that does not exist is an empty answer, not an error", async () => {
@@ -502,12 +523,39 @@ test("a label is fetched by the tag's record id", async () => {
     flightDate: "2026-09-19",
     destination: "PRG",
     orderNumber: "i0lYC",
+    linkedOrders: [],
+    uthringingar: false,
+    hasPhoto: false,
     hasLabel: true,
     zpl: ZPL,
     // The vendor record travels with it, so a client whose stored label is
     // missing or stale can render one itself from the same source the Mac used.
     tagData: TAG_DATA,
   });
+});
+
+test("the label route names every order the row is linked to, not only its text", async () => {
+  // Build 47 review, 2026-10-02: a phone about to put a typed tag on its order
+  // checks the row first. A row linked to another order with a blank "Order No"
+  // (before 452c492), or claimed from a boarding pass and linked only to
+  // Úthringingar, looked free when only the text was reported.
+  airtable.reset();
+  labelStub({
+    id: "recTAGLINKED00001",
+    fields: {
+      "BagTag Number": "0592222222", "Passenger Name": "JONSSON/JON",
+      "Order No copy": ["recORDER0000i0lYC", "recORDER0000i0lYC", "not-a-record-id"],
+      "Úthringingar": ["recUTH00000000001"],
+      Attachments: [{ id: "attPHOTO000000001", url: "https://r2.example/bag.jpg" }],
+    },
+  });
+
+  const body = await (await boot.request("/app/tags/0592222222/label", { headers: AUTH })).json();
+  assert.equal(body.found, true);
+  assert.equal(body.orderNumber, null, "the text is blank");
+  assert.deepEqual(body.linkedOrders, ["i0lYC"], "the link says whose it is, once, and a bad link is no order");
+  assert.equal(body.uthringingar, true);
+  assert.equal(body.hasPhoto, true);
 });
 
 test("a scanned bag tag number reaches its label in one call", async () => {

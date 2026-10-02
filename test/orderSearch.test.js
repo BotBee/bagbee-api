@@ -30,6 +30,14 @@ function onlyCall() {
   return url.searchParams;
 }
 
+/// The order's searchable text as the formula builds it: the four fields
+/// joined, lower-cased, then folded letter by letter.
+const RECORD_TEXT =
+  "LOWER({Nafn viðskiptavinar} & ' ' & {Heimilisfang} & ' ' & {Delivery Address} & ' ' & {Pöntunarnúmer (fx)})";
+
+/// The words a formula FINDs, in order.
+const foundWords = (formula) => [...formula.matchAll(/FIND\('((?:[^'\\]|\\.)*)', /g)].map((m) => m[1]);
+
 test("a plain search matches name, pickup address, delivery address and order number, newest first", async () => {
   airtable.reset();
   const payload = { records: [{ id: "recTESTTESTTEST1", fields: { "Pöntunarnúmer (fx)": "i0lYC" } }] };
@@ -40,19 +48,79 @@ test("a plain search matches name, pickup address, delivery address and order nu
   assert.deepEqual(await res.json(), payload, "Airtable's answer passes through unchanged");
 
   const params = onlyCall();
-  assert.equal(
-    params.get("filterByFormula"),
-    "AND({Greitt}, OR(" +
-      "FIND('laugavegur', LOWER({Nafn viðskiptavinar}))," +
-      "FIND('laugavegur', LOWER({Heimilisfang}))," +
-      "FIND('laugavegur', LOWER({Delivery Address}))," +
-      "FIND('laugavegur', LOWER({Pöntunarnúmer (fx)}))" +
-      "))",
-    "no date clause at all without a window: the whole history is searched",
+  const formula = params.get("filterByFormula");
+  assert.ok(
+    formula.startsWith("AND({Greitt}, FIND('laugavegur', SUBSTITUTE("),
+    `no date clause at all without a window: the whole history is searched — ${formula.slice(0, 80)}`,
   );
+  assert.ok(formula.includes(RECORD_TEXT), "all four fields, as one lower-cased text");
+  assert.deepEqual(foundWords(formula), ["laugavegur"]);
+  assert.ok(formula.endsWith(")"));
   assert.equal(params.get("maxRecords"), "100");
   assert.equal(params.get("sort[0][field]"), "Dagsetning pick-up");
   assert.equal(params.get("sort[0][direction]"), "desc");
+});
+
+// Build 47 review, 2026-10-02: the day tier on the phone ignores accents and
+// matches every word on its own; the 7-day and all-orders tiers matched the raw
+// string, so "jon" found Jón on the day and nothing one tier out.
+
+test("accents and Icelandic letters are folded on both sides: 'jon' and 'Jón' are the same search", async () => {
+  airtable.reset();
+  await search(`q=${encodeURIComponent("Jón")}`);
+  const accented = onlyCall().get("filterByFormula");
+
+  airtable.reset();
+  await search("q=jon");
+  const plain = onlyCall().get("filterByFormula");
+
+  assert.equal(accented, plain);
+  assert.deepEqual(foundWords(plain), ["jon"]);
+
+  // The record side folds the same letters the phone folds.
+  for (const [letter, folded] of [["á", "a"], ["ó", "o"], ["ö", "o"], ["í", "i"], ["ú", "u"], ["é", "e"],
+    ["ý", "y"], ["ð", "d"], ["þ", "th"], ["æ", "ae"], ["ø", "o"]]) {
+    assert.ok(plain.includes(`SUBSTITUTE(`) && plain.includes(`, '${letter}', '${folded}')`), `${letter} → ${folded}`);
+  }
+
+  for (const [typed, expected] of [
+    ["Þórunn", "thorunn"], ["Skólavörðustígur", "skolavordustigur"], ["Lækjargata", "laekjargata"],
+    ["REYKJAVÍK", "reykjavik"], ["Müller", "muller"],
+  ]) {
+    airtable.reset();
+    await search(`q=${encodeURIComponent(typed)}`);
+    assert.deepEqual(foundWords(onlyCall().get("filterByFormula")), [expected], typed);
+  }
+});
+
+test("every word must match on its own, anywhere in the order", async () => {
+  airtable.reset();
+  await search(`q=${encodeURIComponent("  Jón   Laugavegur ")}`);
+  const formula = onlyCall().get("filterByFormula");
+
+  assert.deepEqual(foundWords(formula), ["jon", "laugavegur"], "one FIND per word, in the AND");
+  // Each word searches the same folded text — name and street can be in
+  // different fields.
+  const record = formula.slice(formula.indexOf("SUBSTITUTE("), formula.indexOf("), FIND('laugavegur'"));
+  assert.ok(record.includes(RECORD_TEXT));
+  assert.ok(formula.endsWith(`FIND('laugavegur', ${record}))`), "the second word looks in the same text");
+});
+
+test("a long query keeps the URL inside Airtable's limit", async () => {
+  airtable.reset();
+  const words = "Jón Þórunn Guðmundsdóttir Skólavörðustígur Reykjavík Ísland Hafnarfjörður Kópavogur";
+  await search(`q=${encodeURIComponent(words)}&from=2026-09-29&to=2026-10-05`);
+  const formula = onlyCall().get("filterByFormula");
+  assert.equal(foundWords(formula).length, 6, "six words at most");
+  assert.ok(airtable.calls[0].url.length < 16000, `URL is ${airtable.calls[0].url.length} characters`);
+});
+
+test("a query with nothing left after folding is refused like an empty one", async () => {
+  airtable.reset();
+  const res = await search(`q=${encodeURIComponent("\u0301 \u0308")}`);
+  assert.equal(res.status, 400);
+  assert.deepEqual(await res.json(), { error: "q is required" });
+  assert.deepEqual(airtable.calls, []);
 });
 
 test("from/to limit the pickup day, inclusive, and drop undated orders", async () => {
@@ -66,11 +134,11 @@ test("from/to limit the pickup day, inclusive, and drop undated orders", async (
     formula.startsWith(
       "AND({Greitt}, {Dagsetning pick-up}, " +
         "NOT(IS_BEFORE({Dagsetning pick-up}, '2026-09-29')), " +
-        "NOT(IS_AFTER({Dagsetning pick-up}, '2026-10-05')), OR(",
+        "NOT(IS_AFTER({Dagsetning pick-up}, '2026-10-05')), FIND(",
     ),
     formula,
   );
-  assert.match(formula, /FIND\('jón', LOWER\(\{Heimilisfang\}\)\)/);
+  assert.deepEqual(foundWords(formula), ["jon"], "the text clause follows the window");
 });
 
 test("either end of the window works alone", async () => {
@@ -119,7 +187,7 @@ test("upcoming=1 still drops past pickups, and combines with a window", async ()
   await search("q=x&upcoming=1");
   let formula = onlyCall().get("filterByFormula");
   assert.ok(
-    formula.startsWith(`AND({Greitt}, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${today}')), OR(`),
+    formula.startsWith(`AND({Greitt}, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${today}')), FIND('x', `),
     formula,
   );
 
@@ -135,7 +203,7 @@ test("the query stays a quoted literal: a quote cannot break out of the formula"
   airtable.reset();
   await search(`q=${encodeURIComponent("O'Brien")}`);
   const formula = onlyCall().get("filterByFormula");
-  assert.match(formula, /FIND\('o\\'brien', LOWER\(\{Heimilisfang\}\)\)/);
+  assert.deepEqual(foundWords(formula), ["o\\'brien"]);
 });
 
 test("an Airtable failure keeps the existing error shape", async () => {
