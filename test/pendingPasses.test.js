@@ -411,6 +411,7 @@ test("the order's tag list shows the pending pass, in its place, with what the a
     destination: "PRG",
     delivered: false,
     hasLabel: true,
+    hasPhoto: false,
     createdAt: "2026-09-19T08:00:00.000Z",
     pending: true,
     bcbpRaw: RAW,

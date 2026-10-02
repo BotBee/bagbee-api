@@ -989,27 +989,104 @@ app.get("/app/orders/upcoming", requireAppToken, async (req, res) => {
   }
 });
 
+/// The fields an order search looks in: customer name, pickup address (what
+/// Dagurinn shows on a stop, so what a driver types), delivery address and order
+/// number. Joined with `&`, which turns a lookup into text as well as a string.
+const ORDER_SEARCH_FIELDS = ["Nafn viðskiptavinar", "Heimilisfang", "Delivery Address", "Pöntunarnúmer (fx)"];
+
+/// Letters with no single-accent form, folded first. The same table as the
+/// app's `LabelText.asciiFolded` (and the Mac's `uthringingar.fold`), so the
+/// backend and the phone agree on what "jon" and "thorunn" find.
+const SEARCH_LETTER_FOLDS = [
+  ["ð", "d"], ["þ", "th"], ["æ", "ae"], ["ø", "o"], ["œ", "oe"], ["ß", "ss"], ["ł", "l"],
+];
+
+/// The same fold inside the formula. Airtable has no accent-insensitive
+/// comparison, so the accented lower-case letters a name or a street can carry
+/// are listed one by one: the Icelandic ones, and the European ones a
+/// passenger's name brings. A letter not listed still matches itself.
+const SEARCH_FORMULA_FOLDS = [
+  ...SEARCH_LETTER_FOLDS,
+  ["á", "a"], ["à", "a"], ["â", "a"], ["ä", "a"], ["å", "a"], ["ã", "a"],
+  ["é", "e"], ["è", "e"], ["ê", "e"], ["ë", "e"],
+  ["í", "i"], ["ì", "i"], ["î", "i"], ["ï", "i"],
+  ["ó", "o"], ["ò", "o"], ["ô", "o"], ["ö", "o"], ["õ", "o"],
+  ["ú", "u"], ["ù", "u"], ["û", "u"], ["ü", "u"],
+  ["ý", "y"], ["ÿ", "y"], ["ç", "c"], ["ñ", "n"],
+];
+
+/// A search term folded the way the app folds the day's stops: lower case,
+/// ð→d, þ→th, æ→ae, ø→o and the rest, then every accent stripped.
+function foldSearchText(text) {
+  let out = String(text).toLowerCase();
+  for (const [letter, plain] of SEARCH_LETTER_FOLDS) out = out.split(letter).join(plain);
+  return out.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+
+/// At most this many words are matched. Each one repeats the folded record in
+/// the formula (~1.7 kB once URL-encoded; six make a ~10.4k URL), and Airtable
+/// refuses a URL past 16k. A seventh word in a search for a name and a street
+/// adds nothing.
+const MAX_SEARCH_WORDS = 6;
+
+/// Every word of `q` must appear somewhere in the order — the day tier's rule
+/// on the phone, so "jon laugavegur" is a name and a street, not one string.
+/// Null when nothing searchable is left after folding.
+function orderSearchClause(q) {
+  const words = foldSearchText(q).split(/\s+/).filter(Boolean).slice(0, MAX_SEARCH_WORDS);
+  if (!words.length) return null;
+  const record = SEARCH_FORMULA_FOLDS.reduce(
+    (expr, [letter, plain]) => `SUBSTITUTE(${expr}, '${letter}', '${plain}')`,
+    `LOWER(${ORDER_SEARCH_FIELDS.map((field) => `{${field}}`).join(" & ' ' & ")})`
+  );
+  return words.map((word) => `FIND('${escapeFormulaValue(word)}', ${record})`).join(", ");
+}
+
+/// Paid orders matching `q` on customer name, pickup address, delivery address
+/// or order number, most recent pickup first.
+///
+/// Matched the way Dagurinn's day tier matches on the phone (build 47 review,
+/// 2026-10-02): ignoring case and accents, ð/þ/æ folded, every word on its own.
+/// Before that "jon" found Jón on the day and nothing one tier out.
+///
+/// `from`/`to` (YYYY-MM-DD, inclusive, either or both) limit the pickup day —
+/// Dagurinn widens its search to the week around the day on screen. Like
+/// /app/orders/day they are matched against a strict pattern before they reach
+/// the formula. An undated order cannot sit inside a window, so a window also
+/// drops those.
 app.get("/app/orders/search", requireAppToken, async (req, res) => {
   const q = (req.query.q || "").toString().trim();
   if (!q) return res.status(400).json({ error: "q is required" });
+  const textClause = orderSearchClause(q);
+  if (!textClause) return res.status(400).json({ error: "q is required" });
+
+  const from = (req.query.from || "").toString().trim();
+  const to = (req.query.to || "").toString().trim();
+  for (const [name, value] of [["from", from], ["to", to]]) {
+    if (value && !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return res.status(400).json({ error: `${name} must be YYYY-MM-DD` });
+    }
+  }
 
   // `upcoming=1` drops orders whose pickup has passed. Opt-in, so the older
   // callers of this endpoint keep searching the full history.
   const upcomingOnly = req.query.upcoming === "1";
-  const dateClause = upcomingOnly
-    ? `, {Dagsetning pick-up}, NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}'))`
-    : "";
+  const dateClauses = [];
+  if (upcomingOnly || from || to) dateClauses.push("{Dagsetning pick-up}");
+  if (upcomingOnly) dateClauses.push(`NOT(IS_BEFORE({Dagsetning pick-up}, '${todayISO()}'))`);
+  if (from) dateClauses.push(`NOT(IS_BEFORE({Dagsetning pick-up}, '${from}'))`);
+  if (to) dateClauses.push(`NOT(IS_AFTER({Dagsetning pick-up}, '${to}'))`);
+  const dateClause = dateClauses.map((c) => `, ${c}`).join("");
 
-  const safe = escapeFormulaValue(q.toLowerCase());
-  const formula = `AND({Greitt}${dateClause}, OR(` +
-    `FIND('${safe}', LOWER({Nafn viðskiptavinar})),` +
-    `FIND('${safe}', LOWER({Delivery Address})),` +
-    `FIND('${safe}', LOWER({Pöntunarnúmer (fx)}))` +
-    `))`;
-  const url = `${airtableURL(AIRTABLE_TABLE)}?filterByFormula=${encodeURIComponent(formula)}&maxRecords=100`;
+  const formula = `AND({Greitt}${dateClause}, ${textClause})`;
+  const params = new URLSearchParams({ filterByFormula: formula, maxRecords: "100" });
+  // Newest first, so a search of the whole history spends the 100-row cap on
+  // the orders a driver is likely to mean.
+  params.set("sort[0][field]", "Dagsetning pick-up");
+  params.set("sort[0][direction]", "desc");
 
   try {
-    res.json(await airtableFetch(url));
+    res.json(await airtableFetch(`${airtableURL(AIRTABLE_TABLE)}?${params}`));
   } catch (err) {
     sendAirtableError(res, err, "orders/search");
   }
@@ -1090,7 +1167,14 @@ async function recordIsMissing(err, table, id, what) {
 const TAG_LIST_FIELDS = [
   "BagTag Number", "Order No", "Passenger Name", "PNR",
   "Flight", "Flight Date", "Destination", "Delivered", "Label ZPL", "BCBP Raw",
+  "Attachments",
 ];
+
+/// Whether a tag row already carries a delivery photo. POST /app/delivery-photo
+/// REPLACES the cell, so a phone about to put a photo on a tag needs to know.
+function rowHasPhoto(fields) {
+  return Array.isArray(fields?.Attachments) && fields.Attachments.length > 0;
+}
 
 /// The order behind either identifier, or null if there is no such order.
 ///
@@ -1149,6 +1233,8 @@ function tagSummary(record) {
     destination: f["Destination"] || null,
     delivered: Boolean(f["Delivered"]),
     hasLabel: zpl !== "",
+    // Only the yes/no reaches the phone; the attachment itself stays here.
+    hasPhoto: rowHasPhoto(f),
     createdAt: record.createdTime || null,
     // A row with no plate is a boarding pass scanned while the airport check-in
     // was down (POST /app/passes), waiting for its tag. The raw is what the app
@@ -1278,6 +1364,7 @@ app.get("/app/tags/:tagRef/label", requireAppToken, async (req, res) => {
 
     const f = record.fields || {};
     const zpl = typeof f["Label ZPL"] === "string" ? f["Label ZPL"].trim() : "";
+    const links = Array.isArray(f["Order No copy"]) ? f["Order No copy"] : [];
     let tagData = null;
     if (typeof f["Tag data"] === "string" && f["Tag data"].trim()) {
       try {
@@ -1299,6 +1386,15 @@ app.get("/app/tags/:tagRef/label", requireAppToken, async (req, res) => {
       flightDate: f["Flight Date"] || null,
       destination: f["Destination"] || null,
       orderNumber: f["Order No"] || null,
+      // Every order the row is LINKED to, as order numbers. "Order No" alone
+      // is blank on a row that was linked but never given its text (before
+      // 452c492), and a phone about to put a typed tag on its own order has to
+      // see that the plate already belongs to someone else's.
+      linkedOrders: [...new Set(links.map(orderNumberFromRecordId).filter(Boolean))],
+      // A tag claimed from a boarding pass has no order; it is linked to the
+      // passenger's Úthringingar row instead (see POST /app/tags).
+      uthringingar: Array.isArray(f["Úthringingar"]) && f["Úthringingar"].length > 0,
+      hasPhoto: rowHasPhoto(f),
       hasLabel: zpl !== "",
       zpl: zpl || null,
       tagData,
