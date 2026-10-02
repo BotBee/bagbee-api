@@ -834,6 +834,11 @@ app.get("/app/route", requireAppToken, async (req, res) => {
     const orderByNumber = new Map();
     for (const o of orders) orderByNumber.set(o.fields["Pöntunarnúmer (fx)"], o);
 
+    // A customer's e-mail rides along only for yesterday, today and tomorrow,
+    // the days a driver may need to reach them. Any other day of the route can
+    // be browsed without handing out a list of addresses.
+    const sendEmail = isWithinADayOfToday(date);
+
     const stops = planned
       .map((r) => {
         const f = r.fields;
@@ -860,6 +865,10 @@ app.get("/app/route", requireAppToken, async (req, res) => {
           // Pickup legs only. A delivery leg carries no customer contact by
           // deliberate rule — the bag goes to an airline, not to a person.
           phone: delivery ? null : of["Símanúmer"] || null,
+          email: delivery || !sendEmail ? null : trimmedOrNull(of["Tölvupóstfang"]),
+          // Both legs: the delivery leg ends at this airline's counter.
+          airline: trimmedOrNull(of["Flugfélag"]),
+          flightNumber: trimmedOrNull(of["Flugnúmer"]),
           done: Boolean(delivery ? f["Delivery completed"] : f["Pickup completed"]),
           locationName: f.locationName || null,
           address: f.address || first(of["Heimilisfang"]) || null,
@@ -907,6 +916,139 @@ function baseOrderNumber(orderNumber) {
 function first(value) {
   return Array.isArray(value) ? value[0] : value;
 }
+
+/// Free-text Airtable fields arrive with stray spaces, and a padded e-mail
+/// address breaks the app's mailto: link.
+function trimmedOrNull(value) {
+  const s = typeof value === "string" ? value.trim() : "";
+  return s || null;
+}
+
+/// `date` (YYYY-MM-DD) is yesterday, today or tomorrow. Iceland is UTC, so
+/// calendar days compare as UTC midnights.
+function isWithinADayOfToday(date) {
+  const DAY = 24 * 60 * 60 * 1000;
+  const diff = Date.parse(`${date}T00:00:00Z`) - Date.parse(`${todayISO()}T00:00:00Z`);
+  return Number.isFinite(diff) && Math.abs(diff) <= DAY;
+}
+
+// ---------------------------------------------------------------------------
+// Stop ETA — OptimoRoute's own answer for one leg
+// ---------------------------------------------------------------------------
+
+const OPTIMOROUTE_API_KEY = process.env.OPTIMOROUTE_API_KEY;
+// The phone asks once a minute while an order is open; a slow OptimoRoute must
+// cost it a missing ETA line, not a hung screen.
+const OPTIMO_ETA_TIMEOUT_MS = Number(process.env.OPTIMO_ETA_TIMEOUT_MS) || 4_000;
+// Every open order screen polls, and OptimoRoute allows 5 concurrent requests
+// per account, shared with the website's crons.
+const OPTIMO_ETA_CACHE_MS = 30_000;
+const OPTIMO_ORDER_NO_RX = /^[A-Za-z0-9-]{1,32}$/;
+
+/// orderNo → { at, promise }. The promise is stored, not the answer, so two
+/// phones asking at once share one OptimoRoute call; a failure is dropped at
+/// once so the next tap tries again.
+const stopEtaCache = new Map();
+
+/// OptimoRoute's "YYYY-MM-DD HH:MM:SS" is Iceland wall clock, and Iceland is
+/// UTC all year, so it maps 1:1 onto an ISO instant.
+function optimoDtToISO(value) {
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?/.exec(String(value || "").trim());
+  return m ? `${m[1]}T${m[2]}:${m[3] || "00"}Z` : null;
+}
+
+function optimoEtaError(message) {
+  return Object.assign(new Error(message), { optimo: true });
+}
+
+/// One leg's get_scheduling_info, reduced to what the order screen draws.
+async function fetchStopEta(orderNo) {
+  const none = { orderNo, scheduledAt: null, liveArrivalAt: null, source: "none", lateMinutes: null };
+  const params = new URLSearchParams({ key: OPTIMOROUTE_API_KEY, orderNo });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OPTIMO_ETA_TIMEOUT_MS);
+  let text;
+  try {
+    const response = await fetch(`https://api.optimoroute.com/v1/get_scheduling_info?${params}`, {
+      signal: controller.signal,
+    });
+    text = await response.text();
+    if (!response.ok) throw optimoEtaError(`OptimoRoute ${response.status}`);
+  } catch (err) {
+    // node-fetch's own message quotes the URL, and the URL carries the key:
+    // only a reason of our own wording ever reaches the log.
+    if (err.optimo) throw err;
+    throw optimoEtaError(err?.name === "AbortError" ? "OptimoRoute timed out" : "OptimoRoute unreachable");
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let json;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    throw optimoEtaError("OptimoRoute sent an unreadable answer");
+  }
+  if (json.success === false) {
+    // An order Optimo has never heard of simply has no ETA. Any other refusal
+    // (a wrong key, an ambiguous order number) is ours to fix, and must not
+    // pass for "not scheduled".
+    if (json.code === "ERR_ORD_NOT_FOUND") return none;
+    throw optimoEtaError(`OptimoRoute refused: ${json.code || "unknown"}`);
+  }
+  if (!json.orderScheduled) return none;
+
+  const info = json.scheduleInformation || {};
+  const scheduledAt = optimoDtToISO(info.scheduledAtDt);
+  const liveArrivalAt = optimoDtToISO(info.liveEstimate?.arrivalTimeDt);
+  const lateMinutes = scheduledAt && liveArrivalAt
+    ? Math.round((Date.parse(liveArrivalAt) - Date.parse(scheduledAt)) / 60_000)
+    : null;
+  return {
+    orderNo,
+    scheduledAt,
+    liveArrivalAt,
+    source: liveArrivalAt ? "live" : scheduledAt ? "planned" : "none",
+    lateMinutes,
+  };
+}
+
+/// Where one stop's driver is expected, and how far off the plan that is, for
+/// the order screen opened from Dagurinn. `:optimoOrderNo` is the leg's own
+/// Optimo number (the delivery leg carries "-D"), exactly as /app/route hands it
+/// out. Lateness against the plan when there is no live estimate is the app's
+/// to work out: it knows whether the stop is done.
+app.get("/app/stops/:optimoOrderNo/eta", requireAppToken, async (req, res) => {
+  const orderNo = req.params.optimoOrderNo;
+  if (!OPTIMO_ORDER_NO_RX.test(orderNo)) {
+    return res.status(400).json({ error: "optimoOrderNo must be 1-32 letters, digits or dashes" });
+  }
+  if (!OPTIMOROUTE_API_KEY) {
+    console.error("OPTIMOROUTE_API_KEY is not set — refusing stop ETA requests");
+    return res.status(503).json({ error: "Server not configured" });
+  }
+
+  const now = Date.now();
+  for (const [key, entry] of stopEtaCache) {
+    if (now - entry.at >= OPTIMO_ETA_CACHE_MS) stopEtaCache.delete(key);
+  }
+  let entry = stopEtaCache.get(orderNo);
+  if (!entry) {
+    entry = { at: now, promise: fetchStopEta(orderNo) };
+    stopEtaCache.set(orderNo, entry);
+    entry.promise.catch(() => {
+      if (stopEtaCache.get(orderNo) === entry) stopEtaCache.delete(orderNo);
+    });
+  }
+
+  try {
+    res.json(await entry.promise);
+  } catch (err) {
+    console.error("[stops/eta]", orderNo, err.message);
+    res.status(502).json({ error: "OptimoRoute request failed" });
+  }
+});
 
 /// The colour Airtable holds against each `Requested service` choice, so the
 /// app can colour order rows from the base instead of a palette baked into a
