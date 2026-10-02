@@ -1613,6 +1613,11 @@ function signR2Put({ bucket, key, contentType, host }) {
   };
 }
 
+// Tag numbers fields the shared delivery list reads and writes (added 2026-10-02).
+const DELIVERY_PHOTO_AT = "Delivery photo at";              // fldV5hpKx5YgXlvdb, dateTime UTC
+const DELIVERY_INACTIVE = "Inactive";                       // fldKdVxdoJzrqJPCX, checkbox
+const DELIVERY_ACTIVATION_AT = "Activation requested at";   // fldxtjAIWcPSjpvle, dateTime UTC
+
 app.post("/app/delivery-photo", requireAppToken, async (req, res) => {
   const { recordId, imageBase64 } = req.body || {};
 
@@ -1658,6 +1663,9 @@ app.post("/app/delivery-photo", requireAppToken, async (req, res) => {
       body: JSON.stringify({
         fields: {
           Attachments: [{ url: publicImageURL, filename: `bag_${recordId}.jpg` }],
+          // The shared Afhendingar list (GET /app/deliveries) is keyed on this.
+          // "Last modified" cannot stand in for it: any later edit of the row moves it.
+          [DELIVERY_PHOTO_AT]: new Date().toISOString(),
         },
       }),
     });
@@ -1666,6 +1674,177 @@ app.post("/app/delivery-photo", requireAppToken, async (req, res) => {
   } catch (err) {
     console.error("[delivery-photo]", err);
     res.status(502).json({ error: "Failed to attach photo" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Afhendingar — the delivery list every phone shares
+// ---------------------------------------------------------------------------
+//
+// Until build 47 the list lived only on the phone that took the photo, so a
+// photo could not be found, shown or re-sent from anyone else's phone, and an
+// inactive tag marked on one phone could be reported to the airline again from
+// another. The rows are the Tag numbers rows that carry a delivery photo; the
+// two flags the list needs (inactive, activation requested) live on the same
+// row, so every phone sees the same state.
+
+/// What a delivery row is drawn from. No customer contact fields: the list is
+/// on every driver's phone.
+const DELIVERY_FIELDS = [
+  "BagTag Number", "Order No", "Order No copy", "Passenger Name", "Flight", "Destination",
+  "Attachments", DELIVERY_PHOTO_AT, DELIVERY_INACTIVE, DELIVERY_ACTIVATION_AT, "Last modified",
+];
+const HOUR_MS = 3_600_000;
+const DELIVERIES_DEFAULT_HOURS = 24;
+// A phone that was off for a weekend asks for everything since; three days is
+// already more than the list is for, and keeps the read to a few pages.
+const DELIVERIES_MAX_HOURS = 72;
+const DELIVERIES_MAX_ROWS = 300;
+
+/// An ISO 8601 instant: date and time with its zone (what ISO8601DateFormatter
+/// writes, fractions optional), or a bare date, which is midnight UTC (Iceland
+/// is UTC all year). Anything looser — "yesterday", epoch seconds, a time with
+/// no zone — is refused rather than guessed at.
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2}))?$/;
+
+/// The `since` a request asks for as a canonical ISO string, clamped to the
+/// last 72 h, or null when it is not an instant at all.
+function deliveriesSince(raw, now) {
+  if (raw === undefined || raw === "") return new Date(now - DELIVERIES_DEFAULT_HOURS * HOUR_MS).toISOString();
+  if (typeof raw !== "string") return null;
+  const m = ISO_INSTANT.exec(raw.trim());
+  if (!m) return null;
+  // Date.parse rolls 30 February over into March; a date that does not exist is garbage.
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (mo < 1 || mo > 12 || d < 1 || new Date(Date.UTC(y, mo - 1, d)).getUTCDate() !== d) return null;
+  const ms = Date.parse(raw.trim());
+  if (Number.isNaN(ms)) return null;
+  return new Date(Math.max(ms, now - DELIVERIES_MAX_HOURS * HOUR_MS)).toISOString();
+}
+
+/// Rows photographed after `since`.
+///
+/// A row photographed before "Delivery photo at" existed has only its
+/// attachment, so for those the attachment's own modification time stands in.
+/// IF rather than OR(…, AND(…)): IS_AFTER on an empty date is not reliably
+/// false, and an error in either half of an OR would drop the row.
+function deliveriesFormula(sinceISO) {
+  const since = escapeFormulaValue(sinceISO);
+  return `IF({${DELIVERY_PHOTO_AT}}, IS_AFTER({${DELIVERY_PHOTO_AT}}, '${since}'), ` +
+    `AND({Attachments}!='', IS_AFTER(LAST_MODIFIED_TIME({Attachments}), '${since}')))`;
+}
+
+function deliveryRow(record) {
+  const f = record.fields || {};
+  const photo = Array.isArray(f.Attachments) ? f.Attachments[0] : null;
+  const text = (value) => (typeof value === "string" && value.trim() ? value.trim() : null);
+  return {
+    recordId: record.id,
+    tagNumber: text(f["BagTag Number"]),
+    orderNumber: text(f["Order No"]) || orderNumberFromRecordId((f["Order No copy"] || [])[0]),
+    passengerName: text(f["Passenger Name"]),
+    flight: text(f["Flight"]),
+    destination: text(f["Destination"]),
+    photoUrl: photo?.url || null,
+    photoThumbUrl: photo?.thumbnails?.large?.url || null,
+    // A legacy row has no photo time of its own; "Last modified" is the nearest
+    // the API returns, and is later than the photo if the row was edited since.
+    photoAt: text(f[DELIVERY_PHOTO_AT]) || text(f["Last modified"]) || record.createdTime || null,
+    inactive: f[DELIVERY_INACTIVE] === true,
+    activationRequestedAt: text(f[DELIVERY_ACTIVATION_AT]),
+  };
+}
+
+/// The delivery photos taken since `since` (default the last 24 h, never more
+/// than 72 h back), newest first, up to 300.
+///
+/// The photo URLs are Airtable's: they expire a few hours after this answer,
+/// so a phone re-reads the list rather than keeping them.
+app.get("/app/deliveries", requireAppToken, async (req, res) => {
+  const since = deliveriesSince(req.query.since, Date.now());
+  if (!since) {
+    return res.status(400).json({ error: "since must be an ISO 8601 date-time with a zone, e.g. 2026-10-02T08:00:00Z" });
+  }
+
+  try {
+    const params = [
+      ["filterByFormula", deliveriesFormula(since)],
+      ["sort[0][field]", DELIVERY_PHOTO_AT],
+      ["sort[0][direction]", "desc"],
+    ];
+    for (const field of DELIVERY_FIELDS) params.push(["fields[]", field]);
+    const records = await airtableFetchAll(TAG_TABLE, params, { maxPages: DELIVERIES_MAX_ROWS / 100 });
+
+    // Airtable sorts the legacy rows (no photo time) to the end; this puts them
+    // in their place by the time that stands in for it.
+    const at = (row) => Date.parse(row.photoAt || "") || 0;
+    const rows = records.slice(0, DELIVERIES_MAX_ROWS)
+      .map(deliveryRow)
+      .sort((a, b) => at(b) - at(a) || String(a.tagNumber || "").localeCompare(String(b.tagNumber || "")));
+    res.json(rows);
+  } catch (err) {
+    sendAirtableError(res, err, "deliveries");
+  }
+});
+
+/// Marks a delivered tag inactive (or active again), or records that the
+/// airline has been asked to activate it.
+///
+/// `{ inactive: boolean }` sets or clears "Inactive"; clearing also clears
+/// "Activation requested at", so a tag that goes inactive again is asked for
+/// again. `{ activationRequested: true }` stamps "Activation requested at" with
+/// now, after the phone has sent the mail, so no other phone sends it twice.
+/// Both may come together. Nothing else on the row is written — "Delivered" in
+/// particular is read by other automations. Answers the row in the shape of
+/// GET /app/deliveries.
+app.patch("/app/deliveries/:recordId", requireAppToken, async (req, res) => {
+  const recordId = String(req.params.recordId || "");
+  if (!AIRTABLE_RECORD_ID.test(recordId)) {
+    return res.status(400).json({ error: "recordId must be an Airtable record id" });
+  }
+
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const { inactive, activationRequested } = body;
+  if (inactive !== undefined && typeof inactive !== "boolean") {
+    return res.status(400).json({ error: "inactive must be true or false" });
+  }
+  if (activationRequested !== undefined && activationRequested !== true) {
+    return res.status(400).json({ error: "activationRequested can only be true" });
+  }
+  if (inactive === undefined && activationRequested === undefined) {
+    return res.status(400).json({ error: "nothing to change: send inactive and/or activationRequested" });
+  }
+  if (inactive === false && activationRequested === true) {
+    return res.status(400).json({ error: "an activation request is for an inactive tag" });
+  }
+
+  const fields = {};
+  if (inactive !== undefined) fields[DELIVERY_INACTIVE] = inactive;
+  if (inactive === false) fields[DELIVERY_ACTIVATION_AT] = null;
+  if (activationRequested === true) fields[DELIVERY_ACTIVATION_AT] = new Date().toISOString();
+
+  try {
+    // A list query rather than a GET of the record: it answers a missing id with
+    // an empty page instead of the 403 Airtable gives for "missing or forbidden".
+    const found = await airtableFetch(
+      `${airtableURL(TAG_TABLE)}?${new URLSearchParams([
+        ["filterByFormula", `RECORD_ID()='${escapeFormulaValue(recordId)}'`],
+        ["maxRecords", "1"],
+        ["fields[]", "BagTag Number"],
+      ])}`
+    );
+    if (!(found.records || []).length) {
+      return res.status(404).json({ error: "No such tag row" });
+    }
+
+    const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${recordId}`), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields }),
+    });
+    res.json(deliveryRow(updated));
+  } catch (err) {
+    sendAirtableError(res, err, "deliveries/:recordId");
   }
 });
 
