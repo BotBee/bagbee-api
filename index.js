@@ -1704,6 +1704,12 @@ const DELIVERIES_DEFAULT_HOURS = 24;
 // already more than the list is for, and keeps the read to a few pages.
 const DELIVERIES_MAX_HOURS = 72;
 const DELIVERIES_MAX_ROWS = 300;
+// An inactive tag nobody has asked the airline to activate yet is work still
+// owed, so it stays on every phone's list past the 24 h until it is reported
+// (build 47 review): otherwise a tag marked at 21:00 and not sent that night
+// was gone from every phone at 21:00 the next day and never reported. A week
+// bounds it; a tag older than that has long since flown or been dealt with.
+const DELIVERIES_AWAITING_DAYS = 7;
 
 /// An ISO 8601 instant: date and time with its zone (what ISO8601DateFormatter
 /// writes, fractions optional), or a bare date, which is midnight UTC (Iceland
@@ -1726,16 +1732,24 @@ function deliveriesSince(raw, now) {
   return new Date(Math.max(ms, now - DELIVERIES_MAX_HOURS * HOUR_MS)).toISOString();
 }
 
-/// Rows photographed after `since`.
+/// Photographed after `sinceISO`.
 ///
 /// A row photographed before "Delivery photo at" existed has only its
 /// attachment, so for those the attachment's own modification time stands in.
 /// IF rather than OR(…, AND(…)): IS_AFTER on an empty date is not reliably
 /// false, and an error in either half of an OR would drop the row.
-function deliveriesFormula(sinceISO) {
+function photographedAfter(sinceISO) {
   const since = escapeFormulaValue(sinceISO);
   return `IF({${DELIVERY_PHOTO_AT}}, IS_AFTER({${DELIVERY_PHOTO_AT}}, '${since}'), ` +
     `AND({Attachments}!='', IS_AFTER(LAST_MODIFIED_TIME({Attachments}), '${since}')))`;
+}
+
+/// Rows photographed after `since`, and every row still awaiting its
+/// activation request (inactive, never requested) photographed after
+/// `awaitingSince`, whatever `since` says.
+function deliveriesFormula(sinceISO, awaitingSinceISO) {
+  return `IF(AND({${DELIVERY_INACTIVE}}, NOT({${DELIVERY_ACTIVATION_AT}})), ` +
+    `${photographedAfter(awaitingSinceISO)}, ${photographedAfter(sinceISO)})`;
 }
 
 function deliveryRow(record) {
@@ -1760,21 +1774,28 @@ function deliveryRow(record) {
 }
 
 /// The delivery photos taken since `since` (default the last 24 h, never more
-/// than 72 h back), newest first, up to 300.
+/// than 72 h back), plus the inactive tags still awaiting their activation
+/// request from the last 7 days, newest first, up to 300.
 ///
 /// The photo URLs are Airtable's: they expire a few hours after this answer,
 /// so a phone re-reads the list rather than keeping them.
 app.get("/app/deliveries", requireAppToken, async (req, res) => {
-  const since = deliveriesSince(req.query.since, Date.now());
+  const now = Date.now();
+  const since = deliveriesSince(req.query.since, now);
   if (!since) {
     return res.status(400).json({ error: "since must be an ISO 8601 date-time with a zone, e.g. 2026-10-02T08:00:00Z" });
   }
+  const awaitingSince = new Date(now - DELIVERIES_AWAITING_DAYS * 24 * HOUR_MS).toISOString();
 
   try {
+    // Inactive rows first, so the 300-row cap can never cut off an older tag
+    // still owed its request; the answer is re-sorted by photo time below.
     const params = [
-      ["filterByFormula", deliveriesFormula(since)],
-      ["sort[0][field]", DELIVERY_PHOTO_AT],
+      ["filterByFormula", deliveriesFormula(since, awaitingSince)],
+      ["sort[0][field]", DELIVERY_INACTIVE],
       ["sort[0][direction]", "desc"],
+      ["sort[1][field]", DELIVERY_PHOTO_AT],
+      ["sort[1][direction]", "desc"],
     ];
     for (const field of DELIVERY_FIELDS) params.push(["fields[]", field]);
     const records = await airtableFetchAll(TAG_TABLE, params, { maxPages: DELIVERIES_MAX_ROWS / 100 });
@@ -1791,16 +1812,28 @@ app.get("/app/deliveries", requireAppToken, async (req, res) => {
   }
 });
 
+/// One write to the deliveries' flags at a time. Railway runs a single
+/// instance, so an in-process chain is enough to make the activation send's
+/// "read the rows, mail, stamp" one step that a second phone's send — or a
+/// flag change landing in between — waits behind.
+let deliveriesLock = Promise.resolve();
+function withDeliveriesLock(fn) {
+  const run = deliveriesLock.then(fn);
+  deliveriesLock = run.catch(() => {});
+  return run;
+}
+
 /// Marks a delivered tag inactive (or active again), or records that the
 /// airline has been asked to activate it.
 ///
 /// `{ inactive: boolean }` sets or clears "Inactive"; clearing also clears
 /// "Activation requested at", so a tag that goes inactive again is asked for
 /// again. `{ activationRequested: true }` stamps "Activation requested at" with
-/// now, after the phone has sent the mail, so no other phone sends it twice.
-/// Both may come together. Nothing else on the row is written — "Delivered" in
-/// particular is read by other automations. Answers the row in the shape of
-/// GET /app/deliveries.
+/// now — for a mail a phone has already sent itself (a tag flagged on the
+/// phone before the server knew it); the list's own send is
+/// POST /app/deliveries/activation. Both may come together. Nothing else on the
+/// row is written — "Delivered" in particular is read by other automations.
+/// Answers the row in the shape of GET /app/deliveries.
 app.patch("/app/deliveries/:recordId", requireAppToken, async (req, res) => {
   const recordId = String(req.params.recordId || "");
   if (!AIRTABLE_RECORD_ID.test(recordId)) {
@@ -1828,27 +1861,140 @@ app.patch("/app/deliveries/:recordId", requireAppToken, async (req, res) => {
   if (activationRequested === true) fields[DELIVERY_ACTIVATION_AT] = new Date().toISOString();
 
   try {
-    // A list query rather than a GET of the record: it answers a missing id with
-    // an empty page instead of the 403 Airtable gives for "missing or forbidden".
-    const found = await airtableFetch(
-      `${airtableURL(TAG_TABLE)}?${new URLSearchParams([
-        ["filterByFormula", `RECORD_ID()='${escapeFormulaValue(recordId)}'`],
-        ["maxRecords", "1"],
-        ["fields[]", "BagTag Number"],
-      ])}`
-    );
-    if (!(found.records || []).length) {
-      return res.status(404).json({ error: "No such tag row" });
-    }
+    await withDeliveriesLock(async () => {
+      // A list query rather than a GET of the record: it answers a missing id with
+      // an empty page instead of the 403 Airtable gives for "missing or forbidden".
+      const found = await airtableFetch(
+        `${airtableURL(TAG_TABLE)}?${new URLSearchParams([
+          ["filterByFormula", `RECORD_ID()='${escapeFormulaValue(recordId)}'`],
+          ["maxRecords", "1"],
+          ["fields[]", "BagTag Number"],
+        ])}`
+      );
+      if (!(found.records || []).length) {
+        res.status(404).json({ error: "No such tag row" });
+        return;
+      }
 
-    const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${recordId}`), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fields }),
+      const updated = await airtableFetch(airtableURL(TAG_TABLE, `/${recordId}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fields }),
+      });
+      res.json(deliveryRow(updated));
     });
-    res.json(deliveryRow(updated));
   } catch (err) {
     sendAirtableError(res, err, "deliveries/:recordId");
+  }
+});
+
+/// The handler a tag's activation request goes to, by the tag's prefix:
+/// Icelandair's own tags (0108…) to Icelandair PAX KEF, every other airline's
+/// to Airport Associates — the rule the app has used since it sent these.
+const ACTIVATION_HANDLER_ICELANDAIR = "paxservicemanagerskef@icelandair.is";
+const ACTIVATION_HANDLER_AIRPORT_ASSOCIATES = "pax@airportassociates.com";
+function activationHandlerFor(tag) {
+  return tag.startsWith("0108") ? ACTIVATION_HANDLER_ICELANDAIR : ACTIVATION_HANDLER_AIRPORT_ASSOCIATES;
+}
+
+/// Airtable takes at most ten records in one write.
+const AIRTABLE_BATCH = 10;
+
+/// Asks the airline handlers to activate the given rows' tags — once, however
+/// many phones ask.
+///
+/// The send used to be the phone's: read the list, mail, then stamp each row.
+/// Two phones tapping Send inside that second both saw the tags unrequested
+/// and both mailed the handler, and a stamp lost at the kerb left the tag
+/// looking unsent on every other phone (build 47 review). Here the read, the
+/// mail and the stamp are one step under the deliveries lock, so a second
+/// phone's request finds the rows stamped and mails nothing.
+///
+/// Only rows that are inactive and not yet requested are mailed, grouped by
+/// handler; the rest come back as `skipped`. A handler whose mail fails gets
+/// nothing stamped, so the tag is still owed on every phone. Answers 200
+/// `{ sent, skipped, unstamped }` (rows in the GET shape; `unstamped` the ids
+/// mailed but whose stamp did not take), or 502 with the same lists plus
+/// `failed` when any mail failed.
+app.post("/app/deliveries/activation", requireAppToken, async (req, res) => {
+  const { recordIds } = req.body || {};
+  if (!Array.isArray(recordIds) || recordIds.length === 0 || recordIds.length > ACTIVATION_MAX_TAGS ||
+      !recordIds.every((id) => typeof id === "string" && AIRTABLE_RECORD_ID.test(id))) {
+    return res.status(400).json({ error: `recordIds must be 1-${ACTIVATION_MAX_TAGS} Airtable record ids` });
+  }
+  if (!RESEND_API_KEY) {
+    console.error("Missing RESEND_API_KEY env var");
+    return res.status(500).json({ error: "Email service not configured" });
+  }
+  const ids = [...new Set(recordIds)];
+
+  try {
+    const outcome = await withDeliveriesLock(async () => {
+      const params = [["filterByFormula", `OR(${ids.map((id) => `RECORD_ID()='${id}'`).join(", ")})`]];
+      for (const field of DELIVERY_FIELDS) params.push(["fields[]", field]);
+      const records = await airtableFetchAll(TAG_TABLE, params, { maxPages: Math.ceil(ids.length / 100) });
+
+      const sent = [];
+      const skipped = [];
+      const failed = [];
+      const unstamped = [];
+      let failure = null;
+
+      const byHandler = new Map();
+      for (const record of records) {
+        const f = record.fields || {};
+        const tag = typeof f["BagTag Number"] === "string" ? f["BagTag Number"].trim() : "";
+        const owed = f[DELIVERY_INACTIVE] === true && !f[DELIVERY_ACTIVATION_AT] && ACTIVATION_TAG_RX.test(tag);
+        if (!owed) {
+          skipped.push(deliveryRow(record));
+          continue;
+        }
+        const handler = activationHandlerFor(tag);
+        if (!byHandler.has(handler)) byHandler.set(handler, []);
+        byHandler.get(handler).push({ record, tag });
+      }
+
+      for (const [handler, rows] of byHandler) {
+        const attempt = ACTIVATION_RECIPIENTS.has(handler)
+          ? await sendActivationMail([...new Set(rows.map((r) => r.tag))], handler)
+          : { ok: false, result: { message: `${handler} is not one of the airline handlers this mail may go to` } };
+        if (!attempt.ok) {
+          failed.push(...rows.map((r) => deliveryRow(r.record)));
+          failure ??= attempt.result;
+          continue;
+        }
+
+        // The mail is out: from here on a row must read as requested, so a
+        // stamp that does not take is reported rather than dropped.
+        const at = new Date().toISOString();
+        for (let i = 0; i < rows.length; i += AIRTABLE_BATCH) {
+          const chunk = rows.slice(i, i + AIRTABLE_BATCH);
+          try {
+            const written = await airtableFetch(airtableURL(TAG_TABLE), {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                records: chunk.map((r) => ({ id: r.record.id, fields: { [DELIVERY_ACTIVATION_AT]: at } })),
+              }),
+            });
+            sent.push(...(written.records || []).map(deliveryRow));
+          } catch (err) {
+            console.error(`[activation] mailed ${handler} but could not stamp ${chunk.length} rows:`, err.message, err.body || "");
+            sent.push(...chunk.map((r) => deliveryRow(r.record)));
+            unstamped.push(...chunk.map((r) => r.record.id));
+          }
+        }
+      }
+      return { sent, skipped, failed, unstamped, failure };
+    });
+
+    const { failure, failed, ...lists } = outcome;
+    if (failed.length) {
+      return res.status(502).json({ error: "Failed to send email", detail: failure, ...lists, failed });
+    }
+    res.json(lists);
+  } catch (err) {
+    sendAirtableError(res, err, "deliveries/activation");
   }
 });
 
@@ -1994,6 +2140,23 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
     return res.status(500).json({ error: "Email service not configured" });
   }
 
+  try {
+    const attempt = await sendActivationMail(tagNumbers, recipient);
+    if (!attempt.ok) {
+      return res.status(500).json({ error: "Failed to send email", detail: attempt.result });
+    }
+    res.json({ ok: true, count: tagNumbers.length, id: attempt.result.id, from: attempt.from });
+  } catch (err) {
+    console.error("[activation] send failed:", err);
+    res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });
+  }
+});
+
+/// The activation mail for `tagNumbers` to one handler, from the company
+/// mailbox, retried once from the verified subdomain when Resend refuses that
+/// sender. Answers Resend's last attempt and the sender it went from. Shared by
+/// /send-activation-request and the deliveries list's own send.
+async function sendActivationMail(tagNumbers, recipient) {
   const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
   const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
   const html = `
@@ -2009,34 +2172,28 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
     html,
   };
 
-  try {
-    let from = ACTIVATION_FROM;
-    let attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
+  let from = ACTIVATION_FROM;
+  let attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
 
-    if (!attempt.ok && ACTIVATION_FALLBACK_FROM && ACTIVATION_FALLBACK_FROM !== ACTIVATION_FROM && senderRefused(attempt)) {
-      console.warn(
-        `[activation] Resend refused sender ${ACTIVATION_FROM} (${attempt.status}: ${attempt.result?.message || "no message"}); ` +
-        `retrying from ${ACTIVATION_FALLBACK_FROM}`,
-      );
-      from = ACTIVATION_FALLBACK_FROM;
-      attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
-    }
+  if (!attempt.ok && ACTIVATION_FALLBACK_FROM && ACTIVATION_FALLBACK_FROM !== ACTIVATION_FROM && senderRefused(attempt)) {
+    console.warn(
+      `[activation] Resend refused sender ${ACTIVATION_FROM} (${attempt.status}: ${attempt.result?.message || "no message"}); ` +
+      `retrying from ${ACTIVATION_FALLBACK_FROM}`,
+    );
+    from = ACTIVATION_FALLBACK_FROM;
+    attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
+  }
 
-    if (!attempt.ok) {
-      console.error("[activation] Resend error:", attempt.status, attempt.result);
-      return res.status(500).json({ error: "Failed to send email", detail: attempt.result });
-    }
-
+  if (!attempt.ok) {
+    console.error("[activation] Resend error:", attempt.status, attempt.result);
+  } else {
     console.log(
       `[activation] sent ${tagNumbers.length} tags to ${recipient} from ${from} ` +
       `(cc ${ACTIVATION_CC || "none"}, reply-to ${ACTIVATION_REPLY_TO || "none"}), id=${attempt.result.id}`,
     );
-    res.json({ ok: true, count: tagNumbers.length, id: attempt.result.id, from });
-  } catch (err) {
-    console.error("[activation] send failed:", err);
-    res.status(500).json({ error: "Failed to send email", detail: String(err.message || err) });
   }
-});
+  return { ...attempt, from };
+}
 
 // ---------------------------------------------------------------------------
 // BagBee Vakt (/v2)

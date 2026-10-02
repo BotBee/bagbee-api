@@ -32,12 +32,19 @@ const HOUR = 3_600_000;
 const ROW_ID = "recDELIV000000001";
 
 const formulaOf = (url) => new URL(url).searchParams.get("filterByFormula") || "";
-const sinceIn = (formula) => {
+/// The formula's two cut-offs: the first pair is the week an inactive tag still
+/// awaiting its request stays listed, the second pair the asked-for `since`.
+const cutoffsIn = (formula) => {
   const all = [...formula.matchAll(/'(\d{4}-[^']+)'/g)].map((m) => m[1]);
-  assert.equal(all.length, 2, `the since, once per half, in ${formula}`);
-  assert.ok(all.every((s) => s === all[0]), "both halves of the formula use the same since");
-  return all[0];
+  assert.equal(all.length, 4, `two cut-offs, once per half each, in ${formula}`);
+  assert.equal(all[0], all[1], "both halves of the awaiting branch use the same cut-off");
+  assert.equal(all[2], all[3], "both halves of the since branch use the same since");
+  return { awaiting: all[0], since: all[2] };
 };
+const sinceIn = (formula) => cutoffsIn(formula).since;
+const photographedAfter = (iso) =>
+  `IF({Delivery photo at}, IS_AFTER({Delivery photo at}, '${iso}'), ` +
+  `AND({Attachments}!='', IS_AFTER(LAST_MODIFIED_TIME({Attachments}), '${iso}')))`;
 const airtableReads = () => airtable.calls.filter((c) => !c.options.method || c.options.method === "GET");
 const airtableWrites = () => airtable.calls
   .filter((c) => c.options.method && c.options.method !== "GET" && c.url.startsWith("https://api.airtable.com/"))
@@ -165,16 +172,19 @@ test("GET /app/deliveries asks Airtable for the last 24 h by photo time, newest 
   assert.equal(url.pathname, `/v0/appHB2bNYPAhfUcLv/${TAGS}`);
 
   const formula = formulaOf(url.href);
-  const since = sinceIn(formula);
+  const { awaiting, since } = cutoffsIn(formula);
   assertWithin(since, before - 24 * HOUR, afterMs - 24 * HOUR, "default since");
+  assertWithin(awaiting, before - 7 * 24 * HOUR, afterMs - 7 * 24 * HOUR, "awaiting cut-off");
   assert.equal(
     formula,
-    `IF({Delivery photo at}, IS_AFTER({Delivery photo at}, '${since}'), ` +
-      `AND({Attachments}!='', IS_AFTER(LAST_MODIFIED_TIME({Attachments}), '${since}')))`,
+    `IF(AND({Inactive}, NOT({Activation requested at})), ${photographedAfter(awaiting)}, ${photographedAfter(since)})`,
   );
 
-  assert.equal(url.searchParams.get("sort[0][field]"), "Delivery photo at");
+  // Inactive rows first, so the row cap cannot cut off an older tag still owed.
+  assert.equal(url.searchParams.get("sort[0][field]"), "Inactive");
   assert.equal(url.searchParams.get("sort[0][direction]"), "desc");
+  assert.equal(url.searchParams.get("sort[1][field]"), "Delivery photo at");
+  assert.equal(url.searchParams.get("sort[1][direction]"), "desc");
   assert.equal(url.searchParams.get("pageSize"), "100");
   assert.equal(url.searchParams.get("offset"), null);
 
@@ -215,6 +225,36 @@ test("a since older than 72 h is clamped to 72 h ago", async () => {
     assert.equal(res.status, 200, raw);
     assertWithin(sinceIn(formulaOf(airtable.calls[0].url)), before - 72 * HOUR, afterMs - 72 * HOUR, `clamped ${raw}`);
   }
+});
+
+// Build 47 review: the list asked for the last 24 h only, so an inactive tag
+// nobody sent that night dropped off every phone the next evening and was
+// never reported. Rows still owed their request stay for a week.
+test("an inactive tag still awaiting its request stays listed for 7 days, whatever since says", async () => {
+  for (const raw of [undefined, new Date(Date.now() - 2 * HOUR).toISOString(), "2020-05-05", new Date(Date.now() + HOUR).toISOString()]) {
+    airtable.reset();
+    const before = Date.now();
+    const res = await get(raw === undefined ? "/app/deliveries" : `/app/deliveries?since=${encodeURIComponent(raw)}`);
+    const afterMs = Date.now();
+    assert.equal(res.status, 200, String(raw));
+    const { awaiting, since } = cutoffsIn(formulaOf(airtable.calls[0].url));
+    assertWithin(awaiting, before - 7 * 24 * HOUR, afterMs - 7 * 24 * HOUR, `awaiting cut-off for ${raw}`);
+    assert.ok(Date.parse(awaiting) < Date.parse(since), "the awaiting branch reaches further back than since");
+  }
+
+  // A two-day-old row awaiting its request comes back like any other.
+  airtable.reset();
+  const old = photoRow("recOLDINACTIVE001", {}, {
+    "BagTag Number": "0108777777",
+    "Delivery photo at": new Date(Date.now() - 48 * HOUR).toISOString(),
+    Inactive: true,
+  });
+  airtable.reply = () => ({ status: 200, body: JSON.stringify({ records: [old] }) });
+  const rows = await (await get("/app/deliveries")).json();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].recordId, "recOLDINACTIVE001");
+  assert.equal(rows[0].inactive, true);
+  assert.equal(rows[0].activationRequestedAt, null);
 });
 
 test("a since that is not an ISO instant is 400 and never reaches Airtable", async () => {
@@ -261,8 +301,9 @@ test("the list follows Airtable's offset for at most 300 rows", async () => {
   // The filter and sort ride along on every page.
   for (const call of airtable.calls) {
     const url = new URL(call.url);
-    assert.match(url.searchParams.get("filterByFormula"), /^IF\(\{Delivery photo at\}/);
-    assert.equal(url.searchParams.get("sort[0][field]"), "Delivery photo at");
+    assert.match(url.searchParams.get("filterByFormula"), /^IF\(AND\(\{Inactive\}, NOT\(\{Activation requested at\}\)\), IF\(\{Delivery photo at\}/);
+    assert.equal(url.searchParams.get("sort[0][field]"), "Inactive");
+    assert.equal(url.searchParams.get("sort[1][field]"), "Delivery photo at");
   }
   assert.equal(rows[0].tagNumber, "0108000000");
   assert.equal(rows[299].tagNumber, "0108000299");
