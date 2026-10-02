@@ -1157,12 +1157,16 @@ const SEARCH_FORMULA_FOLDS = [
   ["ý", "y"], ["ÿ", "y"], ["ç", "c"], ["ñ", "n"],
 ];
 
-/// A search term folded the way the app folds the day's stops: lower case,
-/// ð→d, þ→th, æ→ae, ø→o and the rest, then every accent stripped.
+/// A search term folded with exactly the table the formula folds the record
+/// with, so the two sides always agree. A letter the table does not list (š,
+/// ś, ř, ł's cousins) is kept as typed and matches itself: stripping it here
+/// while the record keeps it made "Wiśniewski", typed as booked, find nothing
+/// (build 47 review). Composed first, so a decomposed "á" is the table's "á";
+/// a mark left over with no letter to sit on is dropped.
 function foldSearchText(text) {
-  let out = String(text).toLowerCase();
-  for (const [letter, plain] of SEARCH_LETTER_FOLDS) out = out.split(letter).join(plain);
-  return out.normalize("NFD").replace(/[̀-ͯ]/g, "");
+  let out = String(text).normalize("NFC").toLowerCase();
+  for (const [letter, plain] of SEARCH_FORMULA_FOLDS) out = out.split(letter).join(plain);
+  return out.replace(/[̀-ͯ]/g, "");
 }
 
 /// At most this many words are matched. Each one repeats the folded record in

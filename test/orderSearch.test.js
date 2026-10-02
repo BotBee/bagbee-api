@@ -93,6 +93,30 @@ test("accents and Icelandic letters are folded on both sides: 'jon' and 'Jón' a
   }
 });
 
+// Build 47 review: the query was stripped of every accent while the record
+// side folds only the letters the formula lists, so "Wiśniewski" typed exactly
+// as booked looked for "wisniewski" in "wiśniewski" and found nothing. Both
+// sides now fold with the same table; a letter it does not list matches itself.
+test("a letter the fold table does not list is kept on the query, as the record keeps it", async () => {
+  for (const [typed, expected] of [
+    ["Wiśniewski", ["wiśniewski"]],
+    ["Šimon Dvořák", ["šimon", "dvořak"]],
+    ["Łukasz", ["lukasz"]],
+    ["Jo\u0301n", ["jon"]],
+  ]) {
+    airtable.reset();
+    await search(`q=${encodeURIComponent(typed)}`);
+    const formula = onlyCall().get("filterByFormula");
+    assert.deepEqual(foundWords(formula), expected, typed);
+    // What the record side would hold for the booked name, after the formula's folds.
+    for (const word of expected) {
+      for (const letter of [...word].filter((c) => /[^\x00-\x7f]/.test(c))) {
+        assert.ok(!formula.includes(`, '${letter}', `), `${letter} is not folded on the record side either`);
+      }
+    }
+  }
+});
+
 test("every word must match on its own, anywhere in the order", async () => {
   airtable.reset();
   await search(`q=${encodeURIComponent("  Jón   Laugavegur ")}`);
