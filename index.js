@@ -304,10 +304,12 @@ async function orderFieldsForRow(existing, order, what) {
 ///
 /// A tag whose number is new but whose boarding pass was scanned earlier as a
 /// fallback (POST /app/passes — airport check-in down) fills THAT pending row,
-/// matched on "BCBP Raw" among rows with no plate, instead of adding a second
-/// row for the same bag. The reply then also carries `filledPending: true`, and
-/// `label` can be "cleared" (see below); every existing key is unchanged, and a
-/// claim with no pending row behind it is the same create as before.
+/// matched on "BCBP Raw" among rows with no plate — or, when no row has the
+/// raw, on the same booking, flight, day and check-in sequence
+/// (pendingRowForPass) — instead of adding a second row for the same bag. The
+/// reply then also carries `filledPending: true`, and `label` can be "cleared"
+/// (see below); every existing key is unchanged, and a claim with no pending
+/// row behind it is the same create as before.
 app.post("/app/tags", requireAppToken, async (req, res) => {
   const b = req.body || {};
   const tagNumber = String(b.tagNumber || "").trim();
@@ -348,7 +350,7 @@ app.post("/app/tags", requireAppToken, async (req, res) => {
     // No row carries this plate yet. If the pass it was claimed for was scanned
     // earlier as a fallback, that pending row IS this bag's row and is filled
     // in — the order must end up with one row per bag, or the pass and its tag
-    // count as two. Costs one read, and only on a claim of a brand-new tag.
+    // count as two. Costs a read or two, and only on a claim of a brand-new tag.
     let pendingFill = false;
     if (!existing && incoming["BCBP Raw"]) {
       existing = await pendingRowForPass(incoming["BCBP Raw"]);
@@ -578,8 +580,29 @@ async function passRows(raw) {
 }
 
 /// The one row of a pass still waiting for its plate, or null.
+///
+/// By the raw first. Failing that, a row with no plate on the same booking
+/// that is the same seat on the same flight, read as the lookup reads it
+/// (rowIsForPass): the pass can be filed from one decoding — the paper, on one
+/// phone — and its plate claimed from another — the wallet pass, a reissued
+/// pass, the PDF on the Mac. A fill that waited for byte equality would leave
+/// that pending row waiting, and "claim tag" on it later would put a second
+/// plate on the bag. One more read, and only when the raw finds nothing.
 async function pendingRowForPass(raw) {
-  return (await passRows(raw)).pending[0] || null;
+  const exact = (await passRows(raw)).pending[0];
+  if (exact) return exact;
+  const pass = parseBcbp(raw);
+  if (!pass) return null;
+  const found = await airtableFetch(
+    `${airtableURL(TAG_TABLE)}?${new URLSearchParams({
+      filterByFormula: `AND(${NO_TAG},UPPER(TRIM({PNR}&''))='${escapeFormulaValue(pass.pnr)}')`,
+      maxRecords: "50",
+    })}`
+  );
+  const rows = (found.records || []).filter((r) => rowIsForPass(r.fields || {}, pass));
+  rows.sort((a, b) => (a.createdTime || "").localeCompare(b.createdTime || ""));
+  if (rows.length) console.log(`[tags] pending row ${rows[0].id} matched by booking, not by raw`);
+  return rows[0] || null;
 }
 
 /// Records a boarding pass scanned INSIDE an order while the airport check-in

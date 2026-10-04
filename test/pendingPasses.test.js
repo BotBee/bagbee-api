@@ -82,10 +82,11 @@ function writes() {
 }
 
 /// The tag table, answered by formula: `byTag` for the plate lookup /app/tags
-/// makes first, `byRaw` for the pass lookup, `orders` for the one read on
+/// makes first, `byRaw` for the pass lookup, `pendingByPnr` for the booking's
+/// rows with no plate (read when the raw finds none), `orders` for the one read on
 /// Orders that turns a number into its record id (2026-09-25), and writes
 /// accepted with the id they were addressed to.
-function tagTableStub({ byTag = [], byRaw = [], orders = [] } = {}) {
+function tagTableStub({ byTag = [], byRaw = [], pendingByPnr = [], orders = [] } = {}) {
   airtable.reply = (url, options = {}) => {
     if (options.method === "PATCH") {
       return { status: 200, body: JSON.stringify({ id: url.split("/").pop() }) };
@@ -96,6 +97,9 @@ function tagTableStub({ byTag = [], byRaw = [], orders = [] } = {}) {
     const formula = formulaOf(url);
     if (formula.startsWith("{BagTag Number}=")) return { status: 200, body: JSON.stringify({ records: byTag }) };
     if (formula.startsWith("{BCBP Raw}=")) return { status: 200, body: JSON.stringify({ records: byRaw }) };
+    if (formula.startsWith("AND(LEN({BagTag Number}&'')=0,UPPER(TRIM({PNR}")) {
+      return { status: 200, body: JSON.stringify({ records: pendingByPnr }) };
+    }
     if (formula.startsWith("{Pöntunarnúmer (fx)}=")) return { status: 200, body: JSON.stringify({ records: orders }) };
     return { status: 200, body: JSON.stringify({ records: [] }) };
   };
@@ -316,6 +320,41 @@ test("the oldest pending row for a pass is the one filled", async () => {
 
   await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: RAW });
   assert.ok(writes()[0].url.endsWith("/recPASS0000000001"));
+});
+
+test("a claim from another decoding of the pass fills the pending row the booking finds", async () => {
+  airtable.reset();
+  // The pending row was filed from the paper pass; the tag is claimed from the
+  // wallet pass (or the Mac's PDF), whose raw carries the security block. No
+  // row has that raw, so the booking is read: same flight, day and sequence.
+  const signed = `${RAW}^164GIWVC5EH7JNT684FVNJ91W2QA4DVN5J8K4F0L0GEQ3DF5TGBN8709HKT5D3D`;
+  const companion = {
+    ...PENDING_ROW, id: "recPASSCOMPANION1", createdTime: "2026-09-19T07:00:00.000Z",
+    fields: { ...PENDING_ROW.fields, "BCBP Raw": RAW.replace("JONSDOTTIR/SIGRIDUR ", "JONSSON/JON MR      ").replace("0001 ", "0002 ") },
+  };
+  tagTableStub({ pendingByPnr: [companion, PENDING_ROW] });
+
+  const res = await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: signed, zpl: REAL_ZPL });
+  const body = await res.json();
+  assert.equal(body.id, "recPASS0000000001");
+  assert.equal(body.filledPending, true);
+
+  // The raw first, then the booking's rows with no plate.
+  assert.equal(formulaOf(airtable.calls[1].url), `{BCBP Raw}='${signed}'`);
+  assert.equal(formulaOf(airtable.calls[2].url), "AND(LEN({BagTag Number}&'')=0,UPPER(TRIM({PNR}&''))='ABC123')");
+
+  const all = writes();
+  assert.equal(all.length, 1, "one PATCH, no POST");
+  assert.ok(all[0].url.endsWith("/recPASS0000000001"), "the passenger's row, not the companion's");
+  assert.equal(all[0].body.fields["BagTag Number"], "0592123456");
+  assert.ok(!("BCBP Raw" in all[0].body.fields), "the row keeps the raw it was filed with");
+
+  // A companion's pending row alone is not this bag's: a new row instead.
+  airtable.reset();
+  tagTableStub({ pendingByPnr: [companion] });
+  const other = await (await post("/app/tags", { tagNumber: "0592123456", bcbpRaw: signed })).json();
+  assert.equal(other.created, true);
+  assert.equal(writes()[0].method, "POST");
 });
 
 test("a tag already known by its number never looks at the pass — the old path, byte for byte", async () => {
