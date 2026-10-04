@@ -835,11 +835,11 @@ function nameWords(text) {
   return foldName(text).split(/\s+/).map((w) => w.replace(/[^A-Z]/g, "")).filter(Boolean);
 }
 
-/// Every (surname, given) reading of a name, as letters only. A pass and the
-/// rows the Mac and the check-in write say SURNAME/GIVEN; a row typed by hand
-/// or written from the pass's display name says "Given Surname" (or "Surname,
-/// Given"), and nothing marks where a two-word surname starts, so each split
-/// of those is a candidate.
+/// Every (surname, given words) reading of a name, as letters only. A pass
+/// and the rows the Mac and the check-in write say SURNAME/GIVEN; a row typed
+/// by hand or written from the pass's display name says "Given Surname" (or
+/// "Surname, Given"), and nothing marks where a two-word surname starts, so
+/// each split of those is a candidate.
 function nameReadings(text) {
   const s = String(text || "");
   for (const sep of ["/", ","]) {
@@ -847,26 +847,59 @@ function nameReadings(text) {
     if (at < 0) continue;
     return [{
       surname: nameWords(s.slice(0, at)).join(""),
-      given: nameWords(s.slice(at + 1)).filter((w) => !NAME_TITLES.has(w)).join(""),
+      given: nameWords(s.slice(at + 1)).filter((w) => !NAME_TITLES.has(w)),
     }];
   }
   const words = nameWords(s).filter((w) => !NAME_TITLES.has(w));
   const readings = [];
   for (let k = 1; k < words.length; k++) {
-    readings.push({ given: words.slice(0, k).join(""), surname: words.slice(k).join("") });
-    readings.push({ surname: words.slice(0, k).join(""), given: words.slice(k).join("") });
+    readings.push({ given: words.slice(0, k), surname: words.slice(k).join("") });
+    readings.push({ surname: words.slice(0, k).join(""), given: words.slice(k) });
   }
   return readings;
 }
 
-/// Same surname, and given names that agree as far as both go: the pass cuts
-/// the name at 20 characters ("GUDMUNDSDOTTIR/THORU") and may or may not
-/// carry a middle name, where a row typed by hand has all of it.
+/// A given name as written, and, when its last word ends in a title the
+/// airline glued on ("JOHNMR"), also without it. Both are candidates: the
+/// letters could be the name's own ("ALEXANDR").
+function givenVariants(words) {
+  const variants = [words];
+  const last = words[words.length - 1] || "";
+  for (const title of NAME_TITLES) {
+    if (last.length > title.length + 1 && last.endsWith(title)) {
+      variants.push([...words.slice(0, -1), last.slice(0, -title.length)]);
+    }
+  }
+  return variants;
+}
+
+/// Given names that name the same person, word by word. Either side may carry
+/// middle names the other leaves out ("JOHN" and "John Paul"), and the same
+/// letters split differently are the same name ("ANNA MARIA", "Anna-María").
+/// A word is never a prefix of another — "JOHN" is not "JOHNNY", "ANNA" not
+/// "ANNABELLE": that is a sibling on the same booking, and taking their tag
+/// puts one plate on two bags — except the pass's last word when the pass
+/// filled its 20 characters and so was cut ("GUDMUNDSDOTTIR/THORU").
+function sameGiven(passWords, rowWords, passCut) {
+  if (!passWords.length || !rowWords.length) return false;
+  if (passWords.join("") === rowWords.join("")) return true;
+  const n = Math.min(passWords.length, rowWords.length);
+  for (let i = 0; i < n; i++) {
+    if (passWords[i] === rowWords[i]) continue;
+    const cutHere = passCut && i === passWords.length - 1;
+    if (!cutHere || !rowWords[i].startsWith(passWords[i])) return false;
+  }
+  return true;
+}
+
+/// Same surname, and given names that are the same person's (sameGiven).
+/// `passName` is the pass's 20-character name field, trimmed.
 function sameName(passName, rowName) {
+  const passCut = String(passName || "").length >= 20;
   const rows = nameReadings(rowName);
   return nameReadings(passName).some((a) => rows.some((b) =>
-    a.surname && a.surname === b.surname && a.given && b.given &&
-    (a.given.startsWith(b.given) || b.given.startsWith(a.given))
+    a.surname && a.surname === b.surname &&
+    givenVariants(a.given).some((pg) => givenVariants(b.given).some((rg) => sameGiven(pg, rg, passCut)))
   ));
 }
 

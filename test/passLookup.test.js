@@ -209,6 +209,43 @@ test("the rest of the booking is not this pass: other passengers, the return leg
   assert.deepEqual(await res.json(), { match: "none", claimed: [], pending: [] });
 });
 
+test("a sibling's hand-logged tag is not this passenger's: given names compare word by word", async () => {
+  airtable.reset();
+  // Booking ABC123 on FI204: the son's tag was logged by hand, with no pass
+  // behind it. The father's own scan must not find it — "Prenta" would put a
+  // second copy of the son's plate on the father's bag.
+  const pass = bcbp({ name: "SMITH/JOHN MR", flight: "0204" });
+  const handRow = (id, tag, name) => claimedRow(id, tag, {
+    "BCBP Raw": undefined, "Passenger Name": name, Flight: "FI 204",
+  });
+  stub({ byPnr: [handRow("recSONJOHNNY00001", "0108700001", "SMITH/JOHNNY")] });
+  assert.deepEqual(await (await lookup(pass)).json(), { match: "none", claimed: [], pending: [] });
+
+  for (const [scanned, row] of [["SMITH/ANNA", "Annabelle Smith"], ["JONSSON/ARI", "JONSSON/ARINBJORN"]]) {
+    airtable.reset();
+    stub({ byPnr: [handRow("recSIBLING0000001", "0108700002", row)] });
+    const body = await (await lookup(bcbp({ name: scanned, flight: "0204" }))).json();
+    assert.equal(body.match, "none", `${scanned} must not take ${row}'s tag`);
+  }
+
+  // The father's own hand-logged row is still found beside the son's, and so
+  // is the same name with a middle name added, or a title glued on.
+  for (const [scanned, row] of [
+    ["SMITH/JOHN MR", "SMITH/JOHN"],
+    ["SMITH/JOHN MR", "John Paul Smith"],
+    ["SMITH/JOHNMR", "John Smith"],
+  ]) {
+    airtable.reset();
+    stub({ byPnr: [
+      handRow("recSONJOHNNY00001", "0108700001", "SMITH/JOHNNY"),
+      handRow("recFATHERJOHN0001", "0108700003", row),
+    ] });
+    const body = await (await lookup(bcbp({ name: scanned, flight: "0204" }))).json();
+    assert.equal(body.match, "tolerant", `${scanned} / ${row}`);
+    assert.deepEqual(body.claimed.map((t) => t.recordId), ["recFATHERJOHN0001"], `${scanned} / ${row}`);
+  }
+});
+
 test("nothing on the pass or the booking is none", async () => {
   airtable.reset();
   stub();
