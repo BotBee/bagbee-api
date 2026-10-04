@@ -772,6 +772,227 @@ app.get("/app/passes/pending", requireAppToken, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// A scanned boarding pass → the tags already claimed for it (build 69)
+// ---------------------------------------------------------------------------
+//
+// A tag claimed on the Mac, on another phone or on this one is a row in Tag
+// numbers carrying the pass it was claimed from. A phone that scans the same
+// pass later has to find that row, or it prints BagBee's own label for a bag
+// that already has an airline tag — or, inside an order's check-in, claims a
+// second one.
+
+const PASS_LOOKUP_MAX_RAW = 400;
+
+/// What the tolerant match reads of a row; the rest of it (the vendor record,
+/// the customer's contact fields) has no business in this answer.
+const PASS_LOOKUP_FIELDS = [
+  "BagTag Number", "BCBP Raw", "PNR", "Passenger Name", "Flight", "Flight Date",
+  "Destination", "Order No", "Order No copy", "Label ZPL", "Attachments",
+];
+
+/// Titles an airline appends to the given name ("SIGRIDUR MS"); never part of
+/// the name itself.
+const NAME_TITLES = new Set(["MR", "MRS", "MS", "MISS", "MSTR", "DR", "PROF", "CHD", "INF"]);
+
+function withoutLeadingZeros(value) {
+  return String(value).replace(/^0+(?=.)/, "");
+}
+
+/// The fields of an IATA BCBP ('M' format) the lookup compares, read at their
+/// fixed places in the first leg's mandatory header, or null when the text is
+/// not a pass. Layout (0-based, inclusive): name 2–21, PNR 23–29, from 30–32,
+/// to 33–35, carrier 36–38, flight 39–43, julian date 44–46, seat 48–51,
+/// check-in sequence 52–56. Numbers lose their leading zeros, so "0542" from
+/// one decoder and "542" written by a person are the same flight.
+function parseBcbp(raw) {
+  const s = String(raw || "").trim();
+  if (s.length < 47 || s[0] !== "M" || !/\d/.test(s[1])) return null;
+  const field = (from, to) => s.slice(from, to + 1).trim().toUpperCase();
+  const pass = {
+    name: field(2, 21),
+    pnr: field(23, 29),
+    carrier: field(36, 38),
+    flight: withoutLeadingZeros(field(39, 43)),
+    julian: withoutLeadingZeros(field(44, 46)),
+    seq: s.length > 52 ? withoutLeadingZeros(field(52, 56)) : "",
+  };
+  return pass.pnr && pass.carrier && pass.flight ? pass : null;
+}
+
+/// A name in plain A–Z, the way an airline writes it on a pass: "Jónsdóttir"
+/// is JONSDOTTIR, "Þórunn" THORUNN, "Guðrún" GUDRUN.
+function foldName(text) {
+  return String(text || "").normalize("NFD")
+    .replace(/[Þþ]/g, "TH").replace(/[ÐðĐđ]/g, "D").replace(/[Ææ]/g, "AE")
+    .replace(/[Øø]/g, "O").replace(/[Œœ]/g, "OE").replace(/ß/g, "SS").replace(/[Łł]/g, "L")
+    .replace(/[̀-ͯ]/g, "")
+    .toUpperCase();
+}
+
+/// The words of a name, letters only ("O'Brien" is OBRIEN, "Anna-María" ANNAMARIA).
+function nameWords(text) {
+  return foldName(text).split(/\s+/).map((w) => w.replace(/[^A-Z]/g, "")).filter(Boolean);
+}
+
+/// Every (surname, given) reading of a name, as letters only. A pass and the
+/// rows the Mac and the check-in write say SURNAME/GIVEN; a row typed by hand
+/// or written from the pass's display name says "Given Surname" (or "Surname,
+/// Given"), and nothing marks where a two-word surname starts, so each split
+/// of those is a candidate.
+function nameReadings(text) {
+  const s = String(text || "");
+  for (const sep of ["/", ","]) {
+    const at = s.indexOf(sep);
+    if (at < 0) continue;
+    return [{
+      surname: nameWords(s.slice(0, at)).join(""),
+      given: nameWords(s.slice(at + 1)).filter((w) => !NAME_TITLES.has(w)).join(""),
+    }];
+  }
+  const words = nameWords(s).filter((w) => !NAME_TITLES.has(w));
+  const readings = [];
+  for (let k = 1; k < words.length; k++) {
+    readings.push({ given: words.slice(0, k).join(""), surname: words.slice(k).join("") });
+    readings.push({ surname: words.slice(0, k).join(""), given: words.slice(k).join("") });
+  }
+  return readings;
+}
+
+/// Same surname, and given names that agree as far as both go: the pass cuts
+/// the name at 20 characters ("GUDMUNDSDOTTIR/THORU") and may or may not
+/// carry a middle name, where a row typed by hand has all of it.
+function sameName(passName, rowName) {
+  const rows = nameReadings(rowName);
+  return nameReadings(passName).some((a) => rows.some((b) =>
+    a.surname && a.surname === b.surname && a.given && b.given &&
+    (a.given.startsWith(b.given) || b.given.startsWith(a.given))
+  ));
+}
+
+/// A row's "Flight" ("FI 542", "FI0542", "542") against the pass's carrier and
+/// number.
+function rowFlightMatches(rowFlight, pass) {
+  const flight = String(rowFlight || "").toUpperCase().replace(/\s+/g, "");
+  const number = flight.startsWith(pass.carrier) ? flight.slice(pass.carrier.length) : flight;
+  return /^\d/.test(number) && withoutLeadingZeros(number) === pass.flight;
+}
+
+/// A row's "Flight Date" against the pass's day of the year. A row with no date
+/// is not held against the pass; one with a different day is a different
+/// flight.
+function rowDateMatches(rowDate, pass) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(rowDate || ""));
+  const day = Number(pass.julian);
+  if (!m || !Number.isInteger(day) || day < 1) return true;
+  const sinceJan1 = Date.UTC(+m[1], +m[2] - 1, +m[3]) - Date.UTC(+m[1], 0, 1);
+  return sinceJan1 / 86_400_000 + 1 === day;
+}
+
+/// Whether a row of the same booking was claimed for the scanned pass.
+///
+/// Two decoders of the same barcode can disagree on trailing spaces and the
+/// airline's security block, so a row's own pass is compared on what names the
+/// passenger's seat on the flight — carrier, flight number, date and check-in
+/// sequence number — never byte for byte. A row with no readable pass (typed by
+/// hand, or from before passes were stored) has its name and flight compared
+/// instead; the PNR is already the same, the query asked for it.
+function rowIsForPass(fields, pass) {
+  const theirs = parseBcbp(typeof fields["BCBP Raw"] === "string" ? fields["BCBP Raw"] : "");
+  if (theirs) {
+    return Boolean(pass.seq) && theirs.seq === pass.seq && theirs.carrier === pass.carrier &&
+      theirs.flight === pass.flight && theirs.julian === pass.julian;
+  }
+  return rowFlightMatches(fields["Flight"], pass) && rowDateMatches(fields["Flight Date"], pass) &&
+    sameName(pass.name, fields["Passenger Name"]);
+}
+
+/// Every Tag numbers row on one booking reference. Case and stray spaces in a
+/// hand-typed cell are forgiven.
+async function bookingRows(pnr) {
+  const params = [["filterByFormula", `UPPER(TRIM({PNR}&''))='${escapeFormulaValue(pnr)}'`]];
+  for (const field of PASS_LOOKUP_FIELDS) params.push(["fields[]", field]);
+  return airtableFetchAll(TAG_TABLE, params);
+}
+
+/// Both halves of a row's order: the text, or the number its link carries.
+function lookupOrder(fields) {
+  const links = Array.isArray(fields["Order No copy"]) ? fields["Order No copy"] : [];
+  const text = typeof fields["Order No"] === "string" ? fields["Order No"].trim() : "";
+  return { orderNumber: text || orderNumberFromRecordId(links[0]), orderRecordId: links[0] || null };
+}
+
+function cellText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/// The tags already claimed for a scanned boarding pass, and any pending row
+/// (scanned while the airport check-in was down) still waiting for one.
+///
+/// `?raw=` is the pass exactly as scanned (≤ 400 characters). Two reads, side
+/// by side: the raw itself (passRows — what the same decoder stored), and, when
+/// the raw reads as a pass, every row on its PNR, kept only where it is the
+/// same passenger on the same flight (rowIsForPass). The second runs even when
+/// the first finds rows: a passenger whose one bag was claimed on the Mac from
+/// the PDF and the other on a phone from the paper has a row under each
+/// decoding, and a list that shows one of them invites a third tag.
+///
+/// Reply: `{ match, claimed, pending }`. `match` is "exact" when every row was
+/// found by its raw, "tolerant" when any was found only by the booking, "none"
+/// when there is nothing. `claimed` is sorted by tag number, `pending` oldest
+/// first. No contact fields: the answer is shown on a driver's phone.
+app.get("/app/passes/lookup", requireAppToken, async (req, res) => {
+  const raw = typeof req.query.raw === "string" ? req.query.raw.trim() : "";
+  if (!raw) return res.status(400).json({ error: "raw is required" });
+  if (raw.length > PASS_LOOKUP_MAX_RAW) {
+    return res.status(400).json({ error: `raw must be at most ${PASS_LOOKUP_MAX_RAW} characters` });
+  }
+  const pass = parseBcbp(raw);
+
+  try {
+    const [exact, booking] = await Promise.all([passRows(raw), pass ? bookingRows(pass.pnr) : []]);
+    const exactRows = [...exact.claimed, ...exact.pending];
+    const seen = new Set(exactRows.map((r) => r.id));
+    const tolerantRows = booking.filter((r) => !seen.has(r.id) && rowIsForPass(r.fields || {}, pass));
+    if (tolerantRows.length) {
+      console.log(`[passes/lookup] matched by booking, not by raw: ${tolerantRows.map((r) => r.id).join(", ")}`);
+    }
+
+    const claimed = [];
+    const pending = [];
+    for (const record of [...exactRows, ...tolerantRows]) {
+      const f = record.fields || {};
+      const order = lookupOrder(f);
+      const passengerName = cellText(f["Passenger Name"]);
+      if (isBlankCell(f["BagTag Number"])) {
+        pending.push({ recordId: record.id, ...order, passengerName, _createdAt: record.createdTime || "" });
+        continue;
+      }
+      claimed.push({
+        recordId: record.id,
+        tagNumber: String(f["BagTag Number"]).trim(),
+        ...order,
+        passengerName,
+        flight: cellText(f["Flight"]),
+        flightDate: cellText(f["Flight Date"]),
+        destination: cellText(f["Destination"]),
+        hasLabel: typeof f["Label ZPL"] === "string" && f["Label ZPL"].trim() !== "",
+        photographed: rowHasPhoto(f),
+      });
+    }
+    claimed.sort((a, b) => a.tagNumber.localeCompare(b.tagNumber) || a.recordId.localeCompare(b.recordId));
+    pending.sort((a, b) => a._createdAt.localeCompare(b._createdAt));
+
+    res.json({
+      match: tolerantRows.length ? "tolerant" : exactRows.length ? "exact" : "none",
+      claimed,
+      pending: pending.map(({ _createdAt, ...row }) => row),
+    });
+  } catch (err) {
+    sendAirtableError(res, err, "passes/lookup");
+  }
+});
+
 /// Every page of a filtered table read, not just the first 100.
 ///
 /// A busy day is two stops per order across several drivers and runs well past
