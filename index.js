@@ -2,10 +2,15 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import crypto from "crypto";
-// The only static import from src/: node:crypto + src/auth/jwt.js, and it never
-// throws at import, so it cannot stop the driver routes from booting. Feeds the
-// staff-JWT second check in requireAppToken (spec §4.9 edit (3), build step B8).
+// The only static imports from src/, and neither can throw at import, so neither
+// can stop the driver routes from booting. appJwt.js (node:crypto +
+// src/auth/jwt.js) feeds the staff-JWT second check in requireAppToken (spec §4.9
+// edit (3), build step B8); airlineFees.js imports nothing at all.
 import { staffFromJwt, APP_ROUTES_ACCEPT_STAFF_JWT } from "./src/appJwt.js";
+import {
+  AIRLINE_FEE_ZONES_TABLE, AIRLINE_FEES_TABLE, ZONE as FEE_ZONE, FEE,
+  airlineFeeParams, shapeAirlineFees, createStaleCache,
+} from "./src/airlineFees.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -1054,14 +1059,14 @@ app.get("/app/passes/lookup", requireAppToken, async (req, res) => {
 /// A busy day is two stops per order across several drivers and runs well past
 /// one page; silently returning the first hundred would drop the end of the
 /// evening route, which is exactly the part someone is checking at 17:00.
-async function airtableFetchAll(table, params, { maxPages = 6 } = {}) {
+async function airtableFetchAll(table, params, { maxPages = 6, signal } = {}) {
   const records = [];
   let offset;
   for (let page = 0; page < maxPages; page++) {
     const q = new URLSearchParams(params);
     q.set("pageSize", "100");
     if (offset) q.set("offset", offset);
-    const data = await airtableFetch(`${airtableURL(table)}?${q}`);
+    const data = await airtableFetch(`${airtableURL(table)}?${q}`, signal ? { signal } : undefined);
     records.push(...(data.records || []));
     offset = data.offset;
     if (!offset) break;
@@ -1366,6 +1371,69 @@ app.get("/app/order-colors", requireAppToken, async (req, res) => {
     // carries its own copy.
     console.warn("[order-colors] falling back to empty:", err.message);
     res.json({ service: {} });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Airline fee list — read only
+// ---------------------------------------------------------------------------
+
+/// Five minutes: prices change a few times a year, and a correction in Airtable
+/// should still reach the phones the same morning. AIRLINE_FEES_CACHE_MS can
+/// shorten it (0 = always ask Airtable, still falling back to the last good list).
+const AIRLINE_FEES_CACHE_MS = (() => {
+  const raw = process.env.AIRLINE_FEES_CACHE_MS;
+  const ms = raw === undefined || raw === "" ? NaN : Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 5 * 60_000;
+})();
+// Covers both tables together; past it the phone gets the last good list (or a
+// 502) instead of a spinner. The app gives up at 30 s.
+const AIRLINE_FEES_TIMEOUT_MS = Number(process.env.AIRLINE_FEES_TIMEOUT_MS) || 8_000;
+
+async function loadAirlineFees() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AIRLINE_FEES_TIMEOUT_MS);
+  try {
+    const read = (table, fields) =>
+      airtableFetchAll(table, airlineFeeParams(fields), { maxPages: 10, signal: controller.signal });
+    const [zones, fees] = await Promise.all([
+      read(AIRLINE_FEE_ZONES_TABLE, FEE_ZONE),
+      read(AIRLINE_FEES_TABLE, FEE),
+    ]);
+    return shapeAirlineFees(zones, fees, { fetchedAt: new Date() });
+  } catch (err) {
+    throw err?.name === "AbortError"
+      ? new Error(`Airtable did not answer within ${AIRLINE_FEES_TIMEOUT_MS / 1000} s`)
+      : err;
+  } finally {
+    clearTimeout(timer);
+    controller.abort(); // if one table failed, stop paging the other
+  }
+}
+
+const airlineFeesCache = createStaleCache({ load: loadAirlineFees, ttlMs: AIRLINE_FEES_CACHE_MS });
+
+/// What the airlines charge on top of the ticket (extra bags, overweight,
+/// oversize, sports equipment, cabin bags), per airline and destination zone,
+/// from the "Airline fee zones" and "Airline fees" tables. Only Active rows.
+///
+/// Shape (src/airlineFees.js): { updatedAt, stale, airlines: [{ name, zones, fees }] }.
+/// `updatedAt` is when the server read Airtable. If Airtable fails and an
+/// earlier list is held, that list is served with `stale: true` and the header
+/// X-Airline-Fees-Stale: 1; with nothing held the answer is 502.
+///
+/// Never writes to Airtable.
+app.get("/app/airline-fees", requireAppToken, async (req, res) => {
+  try {
+    const { payload, stale, error } = await airlineFeesCache.get();
+    if (stale) {
+      console.warn(`[airline-fees] Airtable failed (${error?.message}); serving the list read at ${payload.updatedAt}`);
+      res.set("X-Airline-Fees-Stale", "1");
+    }
+    res.json({ ...payload, stale });
+  } catch (err) {
+    console.error("[airline-fees] no list to serve:", err?.message, err?.body || "");
+    res.status(502).json({ error: "The airline fee list could not be read from Airtable" });
   }
 });
 
