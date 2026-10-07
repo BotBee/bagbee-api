@@ -59,15 +59,20 @@ export const DEFAULT_CATEGORY = "Annað";
 const RECORD_ID = /^rec[A-Za-z0-9]{14}$/;
 const ISO_DATE = /^(\d{4}-\d{2}-\d{2})/;
 
-/// The list-records query for one of the two tables: only Active rows, only the
-/// fields named in `fieldMap`, keyed by field id.
+/// The list-records query for one of the two tables: only Active rows, keyed by
+/// field id.
+///
+/// Deliberately NO `fields[]`: Airtable refuses the whole read (422
+/// UNKNOWN_FIELD_NAME) if any named field has been deleted, so listing all of
+/// them would let tidying away Notes or Source URL silently freeze the list on
+/// its last cached copy. Without it, only deleting the Active column (which the
+/// filter needs) or a table can stop the list; the shaper reads only the ids it
+/// knows and ignores any other column.
 export function airlineFeeParams(fieldMap) {
-  const params = [
+  return [
     ["returnFieldsByFieldId", "true"],
     ["filterByFormula", `{${fieldMap.active}}`],
   ];
-  for (const id of Object.values(fieldMap)) params.push(["fields[]", id]);
-  return params;
 }
 
 function text(value) {

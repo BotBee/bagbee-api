@@ -123,8 +123,7 @@ test("reads both tables by field id, Active rows only, never writes, and serves 
     const q = new URL(call.url).searchParams;
     assert.equal(q.get("returnFieldsByFieldId"), "true");
     assert.equal(q.get("filterByFormula"), `{${active}}`);
-    assert.ok(q.getAll("fields[]").length > 0);
-    for (const id of q.getAll("fields[]")) assert.match(id, /^fld[A-Za-z0-9]{14}$/);
+    assert.deepEqual(q.getAll("fields[]"), [], "no fields[]: a deleted column must not 422 the whole read");
   }
 
   assert.equal(body.stale, false);

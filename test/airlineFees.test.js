@@ -52,13 +52,24 @@ test("table and field ids are the ones verified against the base", () => {
   assert.equal(FEE.zones, "fldH4UjV3cCSxmH2v");
 });
 
-test("the query asks by field id, for Active rows only, and names every field it reads", () => {
+test("the query asks by field id, for Active rows only, and names no fields (a deleted column must not 422 the read)", () => {
   const params = airlineFeeParams(FEE);
   const q = new URLSearchParams(params);
   assert.equal(q.get("returnFieldsByFieldId"), "true");
   assert.equal(q.get("filterByFormula"), `{${FEE.active}}`);
-  assert.deepEqual(q.getAll("fields[]").sort(), Object.values(FEE).sort());
+  assert.deepEqual(q.getAll("fields[]"), []);
+  assert.deepEqual(new URLSearchParams(airlineFeeParams(ZONE)).getAll("fields[]"), []);
   assert.equal(new URLSearchParams(airlineFeeParams(ZONE)).get("filterByFormula"), `{${ZONE.active}}`);
+});
+
+test("columns the shaper does not know (Airtable now sends every column) change nothing", () => {
+  const plain = shape([zone("EU", { label: "Evrópa" })], [fee("F1", { zones: ["EU"] })]);
+  const z = zone("EU", { label: "Evrópa" });
+  const f = fee("F1", { zones: ["EU"] });
+  z.fields.fldNewColumn00000 = "added later";
+  f.fields.fldNewColumn00000 = 123;
+  f.fields.fldOtherColumn000 = ["recSomething000000"];
+  assert.deepEqual(shape([z], [f]), plain);
 });
 
 test("destinations split on commas, newlines and semicolons; blanks and repeats go", () => {
