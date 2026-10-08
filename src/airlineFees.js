@@ -14,6 +14,15 @@
 // Every read is by field id (`returnFieldsByFieldId=true`), so renaming a column
 // in Airtable breaks nothing. VERIFIED against the meta API 2026-10-07.
 //
+// BagBee's surcharge: when BagBee pays an airline's fee at the desk it adds a
+// percentage on top. The percent lives in the same table as one row of the
+// airline "BagBee" with category "Álag" (its Airport price is the percent). It
+// is served once, as the top-level `surchargePercent`, never as a fee, and every
+// other airline's fee carries `passengerPrice`: airline price + surcharge,
+// rounded UP to the next 100 kr. (ISK) or the next whole unit (EUR, USD, CAD,
+// GBP). BagBee's own on-site prices are listed as the airline "BagBee" (no
+// zones) and get no surcharge.
+//
 // READ ONLY: nothing here, and nothing in the route, ever writes to Airtable.
 
 export const AIRLINE_FEE_ZONES_TABLE = "tbl2CKpEVoBI2Dxp5"; // Airline fee zones
@@ -55,6 +64,16 @@ export const AIRLINE_ORDER = ["Icelandair", "Neos"];
 
 /// A fee with no category is still worth showing, under "other".
 export const DEFAULT_CATEGORY = "Annað";
+
+/// The "airline" whose rows are BagBee's own prices, and the category (compared
+/// without case or accents) of its row holding the surcharge percent.
+export const BAGBEE_AIRLINE = "BagBee";
+export const SURCHARGE_CATEGORY = "Álag";
+
+/// The passenger total is rounded UP to a multiple of this, per currency. A fee
+/// in any other currency, or with none, gets no passenger total: rounding a
+/// price whose unit is unknown could show the wrong figure.
+export const PASSENGER_PRICE_STEP = { ISK: 100, EUR: 1, USD: 1, CAD: 1, GBP: 1 };
 
 const RECORD_ID = /^rec[A-Za-z0-9]{14}$/;
 const ISO_DATE = /^(\d{4}-\d{2}-\d{2})/;
@@ -117,6 +136,34 @@ export function parseDestinations(value) {
   return out;
 }
 
+/// "Álag", " alag ", "ÁLAG" → "alag": lower case, accents stripped, for matching.
+function folded(value) {
+  return value.normalize("NFD").replace(/\p{M}/gu, "").toLocaleLowerCase("is").trim();
+}
+
+function isBagBee(airline) {
+  return folded(airline) === folded(BAGBEE_AIRLINE);
+}
+
+// Prices and the percent are read to 4 decimals, as integers, so the sum is exact:
+// 11,000 kr. + 10 % is 12,100 kr. (in floating point 12100.000000000002, which a
+// plain ceil would make 12,200), €50 + 10 % is €55 (not 55.00000000000001 → €56).
+const SCALE = 10_000;
+const scaled = (value) => BigInt(Math.round(value * SCALE));
+
+/// airline price + `percent` %, rounded UP to the currency's step; null when the
+/// price or percent is not positive or the currency has no step.
+/// 10900 ISK + 10 % → 12000; 10000 → 11000; €75 → €83.
+export function passengerPrice(price, percent, currency) {
+  const step = typeof currency === "string" ? PASSENGER_PRICE_STEP[currency.trim().toUpperCase()] : undefined;
+  if (!step || !(num(price) > 0) || !(num(percent) > 0)) return null;
+  // total = price × (100 + percent) / 100, all scaled by SCALE.
+  const numerator = scaled(price) * (100n * BigInt(SCALE) + scaled(percent));
+  const denominator = BigInt(SCALE) * 100n * BigInt(SCALE) * BigInt(step);
+  const steps = numerator / denominator + (numerator % denominator === 0n ? 0n : 1n);
+  return Number(steps) * step;
+}
+
 function airlineRank(name) {
   const i = AIRLINE_ORDER.indexOf(name);
   return i === -1 ? AIRLINE_ORDER.length : i;
@@ -138,6 +185,13 @@ function bySortThen(key) {
 /// so a fee whose links all point at switched-off, deleted or foreign zones is
 /// dropped rather than widened to every destination. A fee with no airline takes
 /// its zones' airline; one with neither, or with no item text at all, is dropped.
+/// An airline with no zones (BagBee) is served with `zones: []` and its fees all
+/// have `zoneIds: []`.
+///
+/// BagBee's "Álag" rows are taken out of the fee list; the first of them (by
+/// Sort, then record id, like the list itself) gives `surchargePercent`, its
+/// Airport price, or null when there is no such row. Each fee of every other
+/// airline gets `passengerPrice` (see passengerPrice); BagBee's own are null.
 export function shapeAirlineFees(zoneRecords, feeRecords, { fetchedAt = new Date() } = {}) {
   const zones = new Map(); // recId → { airline, zone }
   for (const record of zoneRecords || []) {
@@ -164,6 +218,7 @@ export function shapeAirlineFees(zoneRecords, feeRecords, { fetchedAt = new Date
   };
   for (const { airline, zone } of zones.values()) airlineEntry(airline).zones.push(zone);
 
+  const surchargeRows = []; // { id, sort, percent }
   for (const record of feeRecords || []) {
     const f = record?.fields || {};
     if (f[FEE.active] !== true || !RECORD_ID.test(record.id || "")) continue;
@@ -172,6 +227,11 @@ export function shapeAirlineFees(zoneRecords, feeRecords, { fetchedAt = new Date
     const live = linked.filter((id) => zones.has(id));
     const airline = text(f[FEE.airline]) || (live.length ? zones.get(live[0]).airline : null);
     if (!airline) continue;
+    const category = text(f[FEE.category]) || DEFAULT_CATEGORY;
+    if (isBagBee(airline) && folded(category) === folded(SURCHARGE_CATEGORY)) {
+      surchargeRows.push({ id: record.id, sort: sortOf(f[FEE.sort]), percent: num(f[FEE.airportPrice]) });
+      continue;
+    }
     const zoneIds = live.filter((id) => zones.get(id).airline === airline);
     if (linked.length && !zoneIds.length) continue;
 
@@ -181,12 +241,13 @@ export function shapeAirlineFees(zoneRecords, feeRecords, { fetchedAt = new Date
     airlineEntry(airline).fees.push({
       id: record.id,
       zoneIds,
-      category: text(f[FEE.category]) || DEFAULT_CATEGORY,
+      category,
       item,
       limits: text(f[FEE.limits]),
       airportPrice: num(f[FEE.airportPrice]),
       onlinePrice: num(f[FEE.onlinePrice]),
       currency: text(f[FEE.currency]),
+      passengerPrice: null, // set below, once the surcharge row has been seen
       per: text(f[FEE.per]),
       notes: text(f[FEE.notes]),
       sourceUrl: text(f[FEE.sourceUrl]),
@@ -196,12 +257,17 @@ export function shapeAirlineFees(zoneRecords, feeRecords, { fetchedAt = new Date
     });
   }
 
+  surchargeRows.sort((a, b) => a.sort - b.sort || a.id.localeCompare(b.id));
+  const surchargePercent = surchargeRows.length ? surchargeRows[0].percent : null;
+
   const list = [...airlines.values()].sort(byAirline);
   for (const entry of list) {
     entry.zones.sort(bySortThen("label"));
     entry.fees.sort(bySortThen("item"));
+    if (isBagBee(entry.name)) continue;
+    for (const fee of entry.fees) fee.passengerPrice = passengerPrice(fee.airportPrice, surchargePercent, fee.currency);
   }
-  return { updatedAt: fetchedAt.toISOString(), airlines: list };
+  return { updatedAt: fetchedAt.toISOString(), surchargePercent, airlines: list };
 }
 
 /// Holds the last good answer for `ttlMs` and falls back to it when a refresh

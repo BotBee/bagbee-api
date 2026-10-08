@@ -1417,7 +1417,11 @@ const airlineFeesCache = createStaleCache({ load: loadAirlineFees, ttlMs: AIRLIN
 /// oversize, sports equipment, cabin bags), per airline and destination zone,
 /// from the "Airline fee zones" and "Airline fees" tables. Only Active rows.
 ///
-/// Shape (src/airlineFees.js): { updatedAt, stale, airlines: [{ name, zones, fees }] }.
+/// Shape (src/airlineFees.js): { updatedAt, stale, surchargePercent, airlines: [{ name, zones, fees }] }.
+/// `surchargePercent` is BagBee's mark-up on airline fees paid at the desk (the
+/// BagBee "Álag" row, never listed as a fee); each other airline's fee carries
+/// `passengerPrice`, the rounded-up total with it. BagBee's own on-site prices
+/// come as the airline "BagBee", with no zones.
 /// `updatedAt` is when the server read Airtable. If Airtable fails and an
 /// earlier list is held, that list is served with `stale: true` and the header
 /// X-Airline-Fees-Stale: 1; with nothing held the answer is 502.

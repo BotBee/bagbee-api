@@ -71,6 +71,35 @@ const FEE_GOLF = {
   },
 };
 
+/// BagBee's surcharge row: served as the top-level surchargePercent, never as a fee.
+const FEE_SURCHARGE = {
+  id: "recFEEBAGBEEALAG1",
+  fields: {
+    fldQwQsdPXB6eai4D: "BagBee · Álag BagBee á gjöld flugfélaga",
+    fldBEd8BlG7e2lE5K: "BagBee",
+    fldWw5qsIkIpPaPwi: "Álag",
+    fldFyq3hTvVryJje0: "Álag BagBee á gjöld flugfélaga",
+    fldlLSl34RgkNUPcv: 10,
+    fld6m4GI0bEIPyQzt: "%",
+    [FEE_ACTIVE]: true,
+  },
+};
+
+/// One of BagBee's own on-site prices: an airline with no zones, no surcharge.
+const FEE_BAGBEE = {
+  id: "recFEEBAGBEEBAG01",
+  fields: {
+    fldQwQsdPXB6eai4D: "BagBee · Auka taska (taska nr. 2–9)",
+    fldBEd8BlG7e2lE5K: "BagBee",
+    fldWw5qsIkIpPaPwi: "Auka taska",
+    fldFyq3hTvVryJje0: "Auka taska (taska nr. 2–9)",
+    fldlLSl34RgkNUPcv: 1990,
+    fldYFTu32JOkH9jxt: "ISK",
+    fld6m4GI0bEIPyQzt: "á tösku",
+    [FEE_ACTIVE]: true,
+  },
+};
+
 /// Both tables answered from fixtures; the fee table comes back in two pages so
 /// the route is seen to follow Airtable's offset.
 function stubTables() {
@@ -80,8 +109,8 @@ function stubTables() {
     if (url.includes(`/${ZONES_TABLE}?`)) return ok({ records: [ZONE_EU] });
     if (url.includes(`/${FEES_TABLE}?`)) {
       return q.get("offset") === "page2"
-        ? ok({ records: [FEE_GOLF] })
-        : ok({ records: [FEE_BAG], offset: "page2" });
+        ? ok({ records: [FEE_GOLF, FEE_SURCHARGE] })
+        : ok({ records: [FEE_BAGBEE, FEE_BAG], offset: "page2" });
     }
     throw new Error(`unexpected fetch ${url}`);
   };
@@ -128,18 +157,23 @@ test("reads both tables by field id, Active rows only, never writes, and serves 
 
   assert.equal(body.stale, false);
   assert.ok(Date.parse(body.updatedAt) >= before - 1000);
-  assert.deepEqual(body.airlines.map((a) => a.name), ["Icelandair", "Neos"]);
-  const [icelandair, neos] = body.airlines;
+  assert.equal(body.surchargePercent, 10, "the surcharge row on page 2 still prices page 1's fees");
+  assert.deepEqual(body.airlines.map((a) => a.name), ["Icelandair", "Neos", "BagBee"]);
+  const [icelandair, neos, bagbee] = body.airlines;
   assert.deepEqual(icelandair.zones, [
     { id: ZONE_EU.id, label: "Evrópa", destinations: ["CPH", "Kaupmannahöfn", "LHR"], sort: 1 },
   ]);
   assert.deepEqual(icelandair.fees, [{
     id: FEE_BAG.id, zoneIds: [ZONE_EU.id], category: "Auka taska", item: "Auka taska 23 kg",
-    limits: null, airportPrice: 14000, onlinePrice: null, currency: "ISK", per: "hvora leið",
-    notes: null, sourceUrl: null, checkedOn: "2026-10-01", confidence: "Official", sort: 1,
+    limits: null, airportPrice: 14000, onlinePrice: null, currency: "ISK", passengerPrice: 15400,
+    per: "hvora leið", notes: null, sourceUrl: null, checkedOn: "2026-10-01", confidence: "Official", sort: 1,
   }]);
   assert.deepEqual(neos.zones, []);
-  assert.deepEqual(neos.fees.map((f) => [f.item, f.zoneIds, f.airportPrice, f.currency]), [["Golfsett", [], 60, "EUR"]]);
+  assert.deepEqual(neos.fees.map((f) => [f.item, f.zoneIds, f.airportPrice, f.currency, f.passengerPrice]),
+    [["Golfsett", [], 60, "EUR", 66]]);
+  assert.deepEqual(bagbee.zones, []);
+  assert.deepEqual(bagbee.fees.map((f) => [f.id, f.zoneIds, f.airportPrice, f.currency, f.passengerPrice]),
+    [[FEE_BAGBEE.id, [], 1990, "ISK", null]], "BagBee's own price, no surcharge row among the fees");
 });
 
 test("Airtable fails after a good read: the last good list is served, marked stale", async () => {
@@ -154,6 +188,7 @@ test("Airtable fails after a good read: the last good list is served, marked sta
   const body = await res.json();
   assert.equal(body.stale, true);
   assert.equal(body.updatedAt, good.updatedAt, "updatedAt still says when the list was really read");
+  assert.equal(body.surchargePercent, 10);
   assert.deepEqual(body.airlines, good.airlines);
   assert.ok(airtable.calls.length > 0, "Airtable was asked again first");
 });

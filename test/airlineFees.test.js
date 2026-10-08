@@ -8,8 +8,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  ZONE, FEE, AIRLINE_FEE_ZONES_TABLE, AIRLINE_FEES_TABLE,
-  airlineFeeParams, parseDestinations, shapeAirlineFees, createStaleCache,
+  ZONE, FEE, AIRLINE_FEE_ZONES_TABLE, AIRLINE_FEES_TABLE, PASSENGER_PRICE_STEP,
+  airlineFeeParams, parseDestinations, shapeAirlineFees, passengerPrice, createStaleCache,
 } from "../src/airlineFees.js";
 
 const FETCHED_AT = new Date("2026-10-07T09:30:00.000Z");
@@ -83,7 +83,7 @@ test("destinations split on commas, newlines and semicolons; blanks and repeats 
 });
 
 test("empty tables give an empty list stamped with the fetch time", () => {
-  assert.deepEqual(shape([], []), { updatedAt: "2026-10-07T09:30:00.000Z", airlines: [] });
+  assert.deepEqual(shape([], []), { updatedAt: "2026-10-07T09:30:00.000Z", surchargePercent: null, airlines: [] });
   assert.deepEqual(shape(undefined, undefined).airlines, []);
 });
 
@@ -111,19 +111,20 @@ test("a full fee row maps onto the contract, with blanks as null", () => {
   );
   assert.deepEqual(body, {
     updatedAt: "2026-10-07T09:30:00.000Z",
+    surchargePercent: null,
     airlines: [{
       name: "Icelandair",
       zones: [{ id: rec("EU"), label: "Evrópa", destinations: ["CPH", "Kaupmannahöfn", "LHR"], sort: 2 }],
       fees: [
         {
           id: rec("F2"), zoneIds: [], category: "Auka taska", item: "Item F2", limits: null,
-          airportPrice: null, onlinePrice: null, currency: null, per: null, notes: null,
+          airportPrice: null, onlinePrice: null, currency: null, passengerPrice: null, per: null, notes: null,
           sourceUrl: null, checkedOn: null, confidence: null, sort: 0,
         },
         {
           id: rec("F1"), zoneIds: [rec("EU")], category: "Yfirvigt", item: "Taska 23–32 kg",
           limits: "23–32 kg", airportPrice: 15000, onlinePrice: 9900, currency: "ISK",
-          per: "á tösku, hvora leið", notes: "Ekki á Saga Premium",
+          passengerPrice: null, per: "á tösku, hvora leið", notes: "Ekki á Saga Premium",
           sourceUrl: "https://www.icelandair.com/support/baggage/", checkedOn: "2026-10-01",
           confidence: "Official", sort: 5,
         },
@@ -218,6 +219,188 @@ test("Checked on keeps the calendar date; anything unreadable is null", () => {
     fee("D2", { [FEE.checkedOn]: "30.09.2026", [FEE.sort]: 2 }),
   ]);
   assert.deepEqual(body.airlines[0].fees.map((f) => f.checkedOn), ["2026-09-30", null]);
+});
+
+// ---------------------------------------------------------------------------
+// BagBee's surcharge — percent from the "Álag" row, passenger totals rounded up
+// ---------------------------------------------------------------------------
+
+/// BagBee's own rows: airline "BagBee", no zones.
+const bagbee = (id, over = {}) => fee(id, { [FEE.airline]: "BagBee", [FEE.currency]: "ISK", ...over });
+const surcharge = (id, percent, over = {}) =>
+  bagbee(id, { [FEE.category]: "Álag", [FEE.item]: "Álag BagBee á gjöld flugfélaga", [FEE.airportPrice]: percent,
+    [FEE.currency]: undefined, [FEE.per]: "%", ...over });
+
+test("passenger price: airline price + 10 %, up to the next 100 kr. — exact, no float drift", () => {
+  for (const [price, total] of [
+    [10900, 12000], [10000, 11000], [11500, 12700], [13900, 15300],
+    [4500, 5000], [3800, 4200], [14900, 16400], [30500, 33600], [1000, 1100], [100, 200], [1, 100],
+    // Where price × 1.1 in floating point lands just above the true total:
+    [3000, 3300], [11000, 12100], [14000, 15400], [23000, 25300],
+  ]) {
+    assert.equal(passengerPrice(price, 10, "ISK"), total, `${price} kr.`);
+  }
+  // The trap is real: 11,000 × 1.1 is 12100.000000000002, which a naive ceil makes 12,200.
+  assert.equal(Math.ceil((11000 * 1.1) / 100) * 100, 12200);
+});
+
+test("passenger price: EUR, USD, CAD and GBP round up to the next whole unit", () => {
+  for (const [price, total] of [[75, 83], [50, 55], [100, 110], [80, 88], [85, 94], [200, 220], [30, 33], [12.5, 14], [0.01, 1]]) {
+    assert.equal(passengerPrice(price, 10, "EUR"), total, `€${price}`);
+  }
+  // €50 × 1.1 is 55.00000000000001 and €100 × 1.1 is 110.00000000000001: naive ceil gives 56 and 111.
+  assert.deepEqual([Math.ceil(50 * 1.1), Math.ceil(100 * 1.1)], [56, 111]);
+  for (const [price, total] of [[90, 99], [110, 121], [200, 220], [210, 231]]) {
+    assert.equal(passengerPrice(price, 10, "EUR"), total, `€${price}`);
+  }
+  assert.equal(passengerPrice(75, 10, "USD"), 83);
+  assert.equal(passengerPrice(75, 10, "CAD"), 83);
+  assert.equal(passengerPrice(75, 10, "GBP"), 83);
+  assert.equal(passengerPrice(75, 10, " eur "), 83, "currency is read without case or padding");
+  assert.deepEqual(Object.keys(PASSENGER_PRICE_STEP).sort(), ["CAD", "EUR", "GBP", "ISK", "USD"]);
+});
+
+test("passenger price: other percents are exact too", () => {
+  assert.equal(passengerPrice(10000, 20, "ISK"), 12000);
+  assert.equal(passengerPrice(10000, 12.5, "ISK"), 11300); // 11,250 → 11,300
+  assert.equal(passengerPrice(10000, 0.1, "ISK"), 10100); // 10,010 → 10,100
+  assert.equal(passengerPrice(100, 15, "EUR"), 115);
+  assert.equal(passengerPrice(0.1, 10, "EUR"), 1);
+});
+
+test("passenger price is null without a positive price, a positive percent or a known currency", () => {
+  assert.equal(passengerPrice(0, 10, "ISK"), null);
+  assert.equal(passengerPrice(-500, 10, "ISK"), null);
+  assert.equal(passengerPrice(null, 10, "ISK"), null);
+  assert.equal(passengerPrice("10900", 10, "ISK"), null);
+  assert.equal(passengerPrice(10900, 0, "ISK"), null);
+  assert.equal(passengerPrice(10900, -10, "ISK"), null);
+  assert.equal(passengerPrice(10900, null, "ISK"), null);
+  assert.equal(passengerPrice(10900, Number.NaN, "ISK"), null);
+  assert.equal(passengerPrice(10900, 10, null), null, "a price with no currency is not guessed at");
+  assert.equal(passengerPrice(10900, 10, "DKK"), null);
+  assert.equal(passengerPrice(10900, 10, "kr."), null);
+});
+
+test("the BagBee Álag row gives surchargePercent and is never listed as a fee", () => {
+  const body = shape(
+    [zone("EU", { label: "Evrópa" })],
+    [
+      fee("BAG", { zones: ["EU"], [FEE.airportPrice]: 10900, [FEE.currency]: "ISK" }),
+      surcharge("PCT", 10),
+      bagbee("OWN", { [FEE.item]: "Auka taska (taska nr. 2–9)", [FEE.airportPrice]: 1990 }),
+    ],
+  );
+  assert.equal(body.surchargePercent, 10);
+  assert.deepEqual(Object.keys(body), ["updatedAt", "surchargePercent", "airlines"]);
+  const all = body.airlines.flatMap((a) => a.fees);
+  assert.ok(!all.some((f) => f.id === rec("PCT")), "the surcharge row is not a fee");
+  assert.ok(!all.some((f) => f.category === "Álag"));
+  assert.deepEqual(body.airlines.map((a) => [a.name, a.fees.map((f) => f.id)]), [
+    ["Icelandair", [rec("BAG")]],
+    ["BagBee", [rec("OWN")]],
+  ]);
+});
+
+test("the Álag row is found whatever the case or accents of airline and category", () => {
+  for (const [airline, category] of [["BagBee", "Álag"], ["bagbee", "alag"], [" BAGBEE ", " ÁLAG "], ["Bagbee", "Alag"]]) {
+    const body = shape([], [fee("BAG", { [FEE.airportPrice]: 10000, [FEE.currency]: "ISK" }),
+      surcharge("PCT", 10, { [FEE.airline]: airline, [FEE.category]: category })]);
+    assert.equal(body.surchargePercent, 10, `${airline} / ${category}`);
+    assert.deepEqual(body.airlines.map((a) => a.name), ["Icelandair"], "an Álag-only airline is not listed");
+    assert.equal(body.airlines[0].fees[0].passengerPrice, 11000);
+  }
+});
+
+test("only BagBee's Álag rows count: another airline's Álag, or BagBee's other categories, are ordinary fees", () => {
+  const body = shape([], [
+    fee("FIALAG", { [FEE.category]: "Álag", [FEE.airportPrice]: 5, [FEE.currency]: "ISK" }),
+    bagbee("OWN", { [FEE.category]: "Auka taska", [FEE.airportPrice]: 10 }),
+  ]);
+  assert.equal(body.surchargePercent, null);
+  assert.deepEqual(body.airlines.map((a) => [a.name, a.fees.map((f) => f.id)]), [
+    ["Icelandair", [rec("FIALAG")]],
+    ["BagBee", [rec("OWN")]],
+  ]);
+});
+
+test("an inactive Álag row is ignored; with several, the first by Sort then id wins", () => {
+  assert.equal(shape([], [surcharge("OFF", 10, { active: false })]).surchargePercent, null);
+  assert.equal(shape([], [surcharge("B", 15, { [FEE.sort]: 2 }), surcharge("C", 12, { [FEE.sort]: 1 })]).surchargePercent, 12);
+  assert.equal(shape([], [surcharge("Z", 15), surcharge("A", 10)]).surchargePercent, 10);
+  // A blank percent is a deliberate "no surcharge", not a reason to look further.
+  const blank = shape([], [surcharge("A", undefined), surcharge("B", 10), fee("BAG", { [FEE.airportPrice]: 10000, [FEE.currency]: "ISK" })]);
+  assert.equal(blank.surchargePercent, null);
+  assert.equal(blank.airlines[0].fees[0].passengerPrice, null);
+});
+
+test("every other airline's priced fee gets passengerPrice; BagBee's own and unpriced fees get null", () => {
+  const body = shape(
+    [zone("EU", { label: "Evrópa" }), zone("TFS", { airline: "Neos", label: "Tenerife" })],
+    [
+      surcharge("PCT", 10),
+      fee("FI1", { zones: ["EU"], [FEE.airportPrice]: 10900, [FEE.currency]: "ISK", [FEE.sort]: 1 }),
+      fee("FI2", { [FEE.airportPrice]: 10000, [FEE.currency]: "ISK", [FEE.sort]: 2 }),
+      fee("FI3", { [FEE.airportPrice]: 85, [FEE.currency]: "EUR", [FEE.sort]: 3 }),
+      fee("FI4", { [FEE.category]: "Innifalið", [FEE.airportPrice]: 0, [FEE.currency]: "ISK", [FEE.sort]: 4 }),
+      fee("FI5", { [FEE.category]: "Innifalið", [FEE.sort]: 5 }),
+      fee("FI6", { [FEE.airportPrice]: 4500, [FEE.sort]: 6 }), // no currency
+      fee("NE1", { [FEE.airline]: "Neos", zones: ["TFS"], [FEE.airportPrice]: 75, [FEE.currency]: "EUR", [FEE.sort]: 1 }),
+      fee("NE2", { [FEE.airline]: "Neos", [FEE.airportPrice]: 50, [FEE.currency]: "EUR", [FEE.sort]: 2 }),
+      bagbee("BB1", { [FEE.airportPrice]: 1990, [FEE.sort]: 1 }),
+      bagbee("BB2", { [FEE.airportPrice]: 7990, [FEE.sort]: 2 }),
+    ],
+  );
+  const prices = Object.fromEntries(body.airlines.map((a) => [a.name, a.fees.map((f) => [f.airportPrice, f.passengerPrice])]));
+  assert.deepEqual(prices, {
+    Icelandair: [[10900, 12000], [10000, 11000], [85, 94], [0, null], [null, null], [4500, null]],
+    Neos: [[75, 83], [50, 55]],
+    BagBee: [[1990, null], [7990, null]],
+  });
+  // airportPrice itself is untouched: the app shows both.
+  assert.equal(body.airlines[0].fees[0].airportPrice, 10900);
+});
+
+test("without an Álag row, or with a zero percent, every passengerPrice is null", () => {
+  for (const extra of [[], [surcharge("PCT", 0)], [surcharge("PCT", -5)]]) {
+    const body = shape([], [fee("BAG", { [FEE.airportPrice]: 10900, [FEE.currency]: "ISK" }), ...extra]);
+    assert.equal(body.airlines[0].fees[0].passengerPrice, null);
+  }
+  assert.equal(shape([], [surcharge("PCT", 0)]).surchargePercent, 0);
+});
+
+test("an airline with no zones (BagBee) is served with zones [] and its fees with zoneIds []", () => {
+  const body = shape(
+    [zone("EU", { label: "Evrópa" })],
+    [
+      fee("FI", { zones: ["EU"] }),
+      surcharge("PCT", 10),
+      bagbee("B1", { [FEE.category]: "Auka taska", [FEE.item]: "Auka taska (taska nr. 2–9)", [FEE.airportPrice]: 1990, [FEE.per]: "á tösku", [FEE.sort]: 1 }),
+      bagbee("B2", { [FEE.category]: "Auka taska", [FEE.item]: "Auka taska frá 10. tösku", [FEE.airportPrice]: 2490, [FEE.per]: "á tösku", [FEE.sort]: 2 }),
+      bagbee("B3", { [FEE.category]: "Yfirstærð", [FEE.item]: "Yfirstærð / íþróttabúnaður", [FEE.airportPrice]: 2490, [FEE.per]: "á hlut", [FEE.sort]: 1 }),
+      bagbee("B4", { [FEE.category]: "Annað", [FEE.item]: "Ný pöntun á staðnum – fyrsta taska", [FEE.airportPrice]: 7990, [FEE.per]: "á pöntun", [FEE.sort]: 1 }),
+    ],
+  );
+  const bb = body.airlines.find((a) => a.name === "BagBee");
+  assert.deepEqual(bb.zones, []);
+  assert.deepEqual(bb.fees.map((f) => [f.item, f.zoneIds, f.airportPrice, f.currency, f.passengerPrice]), [
+    ["Auka taska (taska nr. 2–9)", [], 1990, "ISK", null],
+    ["Ný pöntun á staðnum – fyrsta taska", [], 7990, "ISK", null],
+    ["Yfirstærð / íþróttabúnaður", [], 2490, "ISK", null],
+    ["Auka taska frá 10. tösku", [], 2490, "ISK", null],
+  ]);
+  // A BagBee row linked to another airline's zone is still dropped, not widened.
+  assert.ok(!shape([zone("EU")], [bagbee("X", { zones: ["EU"] })]).airlines.some((a) => a.name === "BagBee"));
+});
+
+test("airline order: Icelandair, Neos, then BagBee and the rest alphabetically", () => {
+  const body = shape([zone("NEOS", { airline: "Neos" })], [
+    bagbee("BB"), fee("PLAY", { [FEE.airline]: "PLAY" }), fee("FI"), fee("ATL", { [FEE.airline]: "Atlantic Airways" }),
+    surcharge("PCT", 10),
+  ]);
+  assert.deepEqual(body.airlines.map((a) => a.name), ["Icelandair", "Neos", "Atlantic Airways", "BagBee", "PLAY"]);
+  assert.deepEqual(shape([zone("NEOS", { airline: "Neos" })], [bagbee("BB"), fee("FI")]).airlines.map((a) => a.name),
+    ["Icelandair", "Neos", "BagBee"]);
 });
 
 // ---------------------------------------------------------------------------
