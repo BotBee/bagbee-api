@@ -88,6 +88,13 @@ function stubStore({ mail = () => ({ status: 200, body: JSON.stringify({ id: "re
       return { status: 200, body: JSON.stringify(record(id)) };
     }
     const formula = u.searchParams.get("filterByFormula") || "";
+    // The mail's passenger/flight lookup reads Úthringingar and Orders too; those
+    // tables are empty here (test/activationDetailsRoutes.test.js fills them).
+    const table = u.pathname.split("/").pop();
+    if (table !== TAGS) {
+      log.push({ kind: "lookup", table, formula });
+      return { status: 200, body: JSON.stringify({ records: [] }) };
+    }
     const ids = [...formula.matchAll(/RECORD_ID\(\)='(rec[A-Za-z0-9]{14})'/g)].map((m) => m[1]);
     log.push({ kind: "read", ids });
     return { status: 200, body: JSON.stringify({ records: ids.filter((id) => rows.has(id)).map(record) }) };

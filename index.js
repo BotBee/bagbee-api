@@ -2,15 +2,19 @@ import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
 import crypto from "crypto";
-// The only static imports from src/, and neither can throw at import, so neither
-// can stop the driver routes from booting. appJwt.js (node:crypto +
-// src/auth/jwt.js) feeds the staff-JWT second check in requireAppToken (spec §4.9
-// edit (3), build step B8); airlineFees.js imports nothing at all.
+// The only static imports from src/, and none can throw at import, so none can
+// stop the driver routes from booting. appJwt.js (node:crypto + src/auth/jwt.js)
+// feeds the staff-JWT second check in requireAppToken (spec §4.9 edit (3), build
+// step B8); airlineFees.js and activationDetails.js import nothing at all.
 import { staffFromJwt, APP_ROUTES_ACCEPT_STAFF_JWT } from "./src/appJwt.js";
 import {
   AIRLINE_FEE_ZONES_TABLE, AIRLINE_FEES_TABLE, ZONE as FEE_ZONE, FEE,
   airlineFeeParams, shapeAirlineFees, createStaleCache,
 } from "./src/airlineFees.js";
+import {
+  TAG_DETAIL_FIELDS as ACTIVATION_TAG_FIELDS, LOOKUP_TIMEOUT_MS as ACTIVATION_LOOKUP_DEFAULT_MS,
+  resolveActivationDetails, renderActivationMail,
+} from "./src/activationDetails.js";
 
 const app = express();
 app.set("trust proxy", 1);
@@ -82,6 +86,10 @@ const ACTIVATION_MAX_TAGS = 200;
 // The phone gives up after 30 s; two attempts must answer inside that, so the
 // driver sees a real reason instead of a timeout and a tempting retap.
 const ACTIVATION_SEND_TIMEOUT_MS = Number(process.env.ACTIVATION_SEND_TIMEOUT_MS) || 10_000;
+// The passenger/flight lookup that decorates the mail (src/activationDetails.js)
+// gets this long for all its reads together; past it the mail goes with what is
+// known, so the lookup can never cost the phone its 30 s.
+const ACTIVATION_LOOKUP_TIMEOUT_MS = Number(process.env.ACTIVATION_LOOKUP_TIMEOUT_MS) || ACTIVATION_LOOKUP_DEFAULT_MS;
 
 // Shared secret the iOS app sends as `x-app-token`. Set in Railway.
 const APP_TOKEN = process.env.APP_TOKEN;
@@ -2279,8 +2287,10 @@ app.post("/app/deliveries/activation", requireAppToken, async (req, res) => {
 
   try {
     const outcome = await withDeliveriesLock(async () => {
+      // The row's own passenger/flight fields come with the same read, so the
+      // mail's details cost no extra Tag numbers read.
       const params = [["filterByFormula", `OR(${ids.map((id) => `RECORD_ID()='${id}'`).join(", ")})`]];
-      for (const field of DELIVERY_FIELDS) params.push(["fields[]", field]);
+      for (const field of new Set([...DELIVERY_FIELDS, ...ACTIVATION_TAG_FIELDS])) params.push(["fields[]", field]);
       const records = await airtableFetchAll(TAG_TABLE, params, { maxPages: Math.ceil(ids.length / 100) });
 
       const sent = [];
@@ -2303,9 +2313,17 @@ app.post("/app/deliveries/activation", requireAppToken, async (req, res) => {
         byHandler.get(handler).push({ record, tag });
       }
 
+      // Passenger, flight and date for every tag about to be mailed, in one
+      // lookup for all handlers. It never throws; whatever it cannot find, the
+      // mail shows as "—".
+      const owed = [...byHandler.values()].flat();
+      const details = owed.length
+        ? await activationDetails(owed.map((r) => r.tag), owed.map((r) => r.record))
+        : null;
+
       for (const [handler, rows] of byHandler) {
         const attempt = ACTIVATION_RECIPIENTS.has(handler)
-          ? await sendActivationMail([...new Set(rows.map((r) => r.tag))], handler)
+          ? await sendActivationMail([...new Set(rows.map((r) => r.tag))], handler, details)
           : { ok: false, result: { message: `${handler} is not one of the airline handlers this mail may go to` } };
         if (!attempt.ok) {
           failed.push(...rows.map((r) => deliveryRow(r.record)));
@@ -2452,8 +2470,6 @@ function activationIdempotencyKey(from, recipient, tagNumbers) {
   return `activation-${digest}`;
 }
 
-const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
-
 /// Resend refuses a sender it cannot sign for with 403 and a message naming the
 /// domain ("The bagbee.is domain is not verified…", or for its own test sender
 /// "You can only send testing emails to your own email address…"). Only that
@@ -2490,7 +2506,10 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
   }
 
   try {
-    const attempt = await sendActivationMail(tagNumbers, recipient);
+    // A local-only item has no row id on the phone, so its details are looked
+    // up by tag number; a tag with no row is listed with "—".
+    const details = await activationDetails(tagNumbers);
+    const attempt = await sendActivationMail(tagNumbers, recipient, details);
     if (!attempt.ok) {
       return res.status(500).json({ error: "Failed to send email", detail: attempt.result });
     }
@@ -2501,17 +2520,36 @@ app.post("/send-activation-request", requireAppToken, async (req, res) => {
   }
 });
 
+/// Passenger, flight and flight date for each tag, for the activation mail
+/// (src/activationDetails.js): from `tagRecords` when the rows are in hand,
+/// else by looking the tag numbers up. READ ONLY, bounded by
+/// ACTIVATION_LOOKUP_TIMEOUT_MS, never throws: answers a Map, or null when not
+/// even the tags could be read — the mail then lists bare tags, as it did
+/// before the details existed.
+async function activationDetails(tagNumbers, tagRecords) {
+  const { details, problems } = await resolveActivationDetails({
+    tagNumbers,
+    tagRecords,
+    read: (table, params, signal) => airtableFetchAll(table, params, { maxPages: 3, signal }),
+    timeoutMs: ACTIVATION_LOOKUP_TIMEOUT_MS,
+  });
+  if (problems.length) {
+    console.warn(`[activation] details lookup incomplete for ${tagNumbers.length} tags, mailing what is known: ${problems.join("; ")}`);
+  }
+  return details;
+}
+
 /// The activation mail for `tagNumbers` to one handler, from the company
 /// mailbox, retried once from the verified subdomain when Resend refuses that
 /// sender. Answers Resend's last attempt and the sender it went from. Shared by
 /// /send-activation-request and the deliveries list's own send.
-async function sendActivationMail(tagNumbers, recipient) {
-  const lines = tagNumbers.map((t) => `• ${t}`).join("\n");
-  const text = `Please activate these inactive bag tags:\n\n${lines}\n`;
-  const html = `
-    <p>Please activate these inactive bag tags:</p>
-    <ul>${tagNumbers.map((t) => `<li><code>${escapeHtml(t)}</code></li>`).join("")}</ul>
-  `;
+///
+/// `details` (from activationDetails) turns the list into a table of tag,
+/// passenger, flight and flight date; without it the mail is the bare list. The
+/// idempotency key is still the tags alone, and the table is sorted by tag, so
+/// the same tags make the same mail and a retap is still one request.
+async function sendActivationMail(tagNumbers, recipient, details = null) {
+  const { text, html } = renderActivationMail(tagNumbers, details);
   const message = {
     to: [recipient],
     cc: ACTIVATION_CC ? [ACTIVATION_CC] : undefined,

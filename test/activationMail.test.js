@@ -88,7 +88,10 @@ test("sender is the company mailbox; a Resend refusal of it is retried once from
     assert.deepEqual(message.cc, ["bagbee@bagbee.is"], "ops copy");
     assert.equal(message.reply_to, "bagbee@bagbee.is", "a handler's reply lands in the real mailbox");
     assert.equal(message.subject, "Inactive bag tags — please activate (2)");
-    assert.match(message.text, /• 0108005884\n• 0523914486/);
+    // No Tag numbers row for either (the stub has none), so each is listed with
+    // "—" for passenger, flight and date (test/activationDetailsRoutes.test.js
+    // covers the details themselves).
+    assert.match(message.text, /• 0108005884 — — — — — —\n• 0523914486 — — — — — —/);
     assert.match(message.html, /<code>0108005884<\/code>/);
   }
 });
