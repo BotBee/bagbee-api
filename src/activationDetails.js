@@ -36,7 +36,8 @@
 // index.js imports it statically (it cannot throw at import) and hands it a
 // `read(table, params, signal)` over its Airtable client; the tests hand it a
 // stub. READ ONLY: nothing here writes to Airtable, and Orders in particular is
-// only ever read.
+// only ever read. Its one piece of state is `activationBodies` (see "Memo"
+// below), an in-process map with no I/O.
 //
 // Úthringingar and Orders are read by field id (`returnFieldsByFieldId=true`),
 // so a renamed column breaks nothing; Tag numbers by name, because the
@@ -440,3 +441,56 @@ export function renderActivationMail(tagNumbers, details) {
   `;
   return { text, html };
 }
+
+// ---------------------------------------------------------------------------
+// Memo — one body per idempotency key
+// ---------------------------------------------------------------------------
+//
+// Resend answers a reused Idempotency-Key with the original response only when
+// the payload is the same; the same key with a different payload is a 409
+// (invalid_idempotent_request). The key is the tags, the handler, the sender
+// and the ten-minute window, but the body now also depends on a lookup that
+// runs again on every tap, and can come out differently: a timeout or a 429 on
+// one tap and not the next, or a claim filling in the passenger in between.
+// So a retap after a send that timed out at our end (and may well have gone)
+// would carry the same key with a new body, be refused, leave the rows owed and
+// unstamped, and the first tap after the window rolled over would mail the
+// handler a second time.
+//
+// The memo pins the body to the key instead: the first body rendered for a
+// handler and a tag set inside a window is the body every later send of the
+// same tags to the same handler in that window carries, whatever the lookup
+// says by then. A body from an earlier window is dropped the first time a later
+// window is asked about. In-process, which is enough because Railway runs a
+// single instance (the same assumption as withDeliveriesLock in index.js);
+// held here rather than in index.js so a test can start each case empty.
+
+/// More distinct sends than this in ten minutes is not a driver tapping Send;
+/// the oldest is dropped rather than let the map grow.
+const MEMO_MAX = 100;
+
+export function createBodyMemo({ max = MEMO_MAX } = {}) {
+  const held = new Map(); // key → { bucket, body }
+  return {
+    /// The body first rendered for `key` in window `bucket`; `render()` makes
+    /// it the first time and its answer is kept for the rest of the window.
+    body(bucket, key, render) {
+      for (const [k, v] of held) if (v.bucket !== bucket) held.delete(k);
+      const hit = held.get(key);
+      if (hit) return hit.body;
+      const body = render();
+      held.set(key, { bucket, body });
+      while (held.size > max) held.delete(held.keys().next().value);
+      return body;
+    },
+    get size() {
+      return held.size;
+    },
+    clear() {
+      held.clear();
+    },
+  };
+}
+
+/// The process's memo, used by index.js's sendActivationMail.
+export const activationBodies = createBodyMemo();

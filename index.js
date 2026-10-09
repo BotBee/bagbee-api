@@ -13,7 +13,7 @@ import {
 } from "./src/airlineFees.js";
 import {
   TAG_DETAIL_FIELDS as ACTIVATION_TAG_FIELDS, LOOKUP_TIMEOUT_MS as ACTIVATION_LOOKUP_DEFAULT_MS,
-  resolveActivationDetails, renderActivationMail,
+  resolveActivationDetails, renderActivationMail, activationBodies,
 } from "./src/activationDetails.js";
 
 const app = express();
@@ -2288,10 +2288,23 @@ app.post("/app/deliveries/activation", requireAppToken, async (req, res) => {
   try {
     const outcome = await withDeliveriesLock(async () => {
       // The row's own passenger/flight fields come with the same read, so the
-      // mail's details cost no extra Tag numbers read.
-      const params = [["filterByFormula", `OR(${ids.map((id) => `RECORD_ID()='${id}'`).join(", ")})`]];
-      for (const field of new Set([...DELIVERY_FIELDS, ...ACTIVATION_TAG_FIELDS])) params.push(["fields[]", field]);
-      const records = await airtableFetchAll(TAG_TABLE, params, { maxPages: Math.ceil(ids.length / 100) });
+      // mail's details cost no extra Tag numbers read. They are asked for by
+      // name, so a renamed or deleted detail column is a 422 for the whole read;
+      // that must cost the details, not the activation, so the read is made
+      // once more with the delivery fields alone and the mail says what those
+      // rows still say ("—" for the rest). Any other failure fails as before.
+      const where = [["filterByFormula", `OR(${ids.map((id) => `RECORD_ID()='${id}'`).join(", ")})`]];
+      const readRows = (fields) => airtableFetchAll(TAG_TABLE, [...where, ...fields.map((f) => ["fields[]", f])],
+        { maxPages: Math.ceil(ids.length / 100) });
+      let records;
+      try {
+        records = await readRows([...new Set([...DELIVERY_FIELDS, ...ACTIVATION_TAG_FIELDS])]);
+      } catch (err) {
+        if (err?.status !== 422) throw err;
+        console.warn(`[activation] Tag numbers refused the mail's detail fields (${err.body || err.message}); ` +
+          "reading the delivery fields alone, the mail goes with what they say");
+        records = await readRows(DELIVERY_FIELDS);
+      }
 
       const sent = [];
       const skipped = [];
@@ -2461,11 +2474,14 @@ async function resendSend(payload, idempotencyKey) {
 /// minutes is one request, however many times it is tapped: a retap after an
 /// ambiguous failure gets Resend's original answer back instead of a second mail.
 /// The sender is part of the key because the fallback attempt carries a different
-/// payload, and Resend rejects a reused key whose payload differs.
-function activationIdempotencyKey(from, recipient, tagNumbers) {
-  const bucket = Math.floor(Date.now() / 600_000);
+/// payload, and Resend rejects a reused key whose payload differs. For the same
+/// reason the body under one key never changes: sendActivationMail takes it from
+/// activationBodies, keyed by activationMailKey in the same `bucket`.
+const activationBucket = () => Math.floor(Date.now() / 600_000);
+const activationMailKey = (recipient, tagNumbers) => `${recipient.toLowerCase()}|${[...tagNumbers].sort().join(",")}`;
+function activationIdempotencyKey(from, recipient, tagNumbers, bucket) {
   const digest = crypto.createHash("sha256")
-    .update([from, recipient.toLowerCase(), [...tagNumbers].sort().join(","), bucket].join("|"))
+    .update([from, activationMailKey(recipient, tagNumbers), bucket].join("|"))
     .digest("hex");
   return `activation-${digest}`;
 }
@@ -2546,10 +2562,16 @@ async function activationDetails(tagNumbers, tagRecords) {
 ///
 /// `details` (from activationDetails) turns the list into a table of tag,
 /// passenger, flight and flight date; without it the mail is the bare list. The
-/// idempotency key is still the tags alone, and the table is sorted by tag, so
-/// the same tags make the same mail and a retap is still one request.
+/// idempotency key is still the tags alone, so the body is pinned to it: the
+/// first body rendered for these tags to this handler in this ten-minute window
+/// is the one every retap in the window sends (activationBodies), even if this
+/// tap's lookup came out differently. A retap after an ambiguous failure is then
+/// the same payload under the same key, and Resend answers it with the original
+/// send instead of refusing it as a different request.
 async function sendActivationMail(tagNumbers, recipient, details = null) {
-  const { text, html } = renderActivationMail(tagNumbers, details);
+  const bucket = activationBucket();
+  const { text, html } = activationBodies.body(bucket, activationMailKey(recipient, tagNumbers),
+    () => renderActivationMail(tagNumbers, details));
   const message = {
     to: [recipient],
     cc: ACTIVATION_CC ? [ACTIVATION_CC] : undefined,
@@ -2560,7 +2582,7 @@ async function sendActivationMail(tagNumbers, recipient, details = null) {
   };
 
   let from = ACTIVATION_FROM;
-  let attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
+  let attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers, bucket));
 
   if (!attempt.ok && ACTIVATION_FALLBACK_FROM && ACTIVATION_FALLBACK_FROM !== ACTIVATION_FROM && senderRefused(attempt)) {
     console.warn(
@@ -2568,7 +2590,7 @@ async function sendActivationMail(tagNumbers, recipient, details = null) {
       `retrying from ${ACTIVATION_FALLBACK_FROM}`,
     );
     from = ACTIVATION_FALLBACK_FROM;
-    attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers));
+    attempt = await resendSend({ ...message, from }, activationIdempotencyKey(from, recipient, tagNumbers, bucket));
   }
 
   if (!attempt.ok) {

@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import {
   TAG_TABLE, UTHRINGINGAR_TABLE, ORDERS_TABLE, UTHR, ORDER, TAG_DETAIL_FIELDS,
   resolveActivationDetails, renderActivationMail, formatFlightDate, cleanValue, mergeSources,
+  createBodyMemo,
 } from "../src/activationDetails.js";
 
 const UTHR_ROW = "recUTHR0000000001";
@@ -306,4 +307,36 @@ test("without details, the bare list it always was, byte for byte", () => {
     <ul><li><code>0523914486</code></li><li><code>0108005884</code></li></ul>
   `,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Memo: one body per key per window
+// ---------------------------------------------------------------------------
+
+test("memo: inside a window the first body rendered for a key is the one handed back", () => {
+  const memo = createBodyMemo();
+  let renders = 0;
+  const render = (text) => () => { renders++; return { text, html: `<p>${text}</p>` }; };
+  const first = memo.body(7, "pax@x|1,2", render("bare"));
+  const again = memo.body(7, "pax@x|1,2", render("with details"));
+  assert.equal(again, first, "the retap's own render is not used");
+  assert.equal(renders, 1);
+  assert.equal(memo.body(7, "pax@x|1,3", render("other tags")).text, "other tags", "another key is another body");
+  assert.equal(memo.size, 2);
+});
+
+test("memo: a later window renders afresh and drops the earlier window's bodies", () => {
+  const memo = createBodyMemo();
+  memo.body(7, "k", () => ({ text: "seven" }));
+  memo.body(7, "j", () => ({ text: "seven too" }));
+  assert.equal(memo.body(8, "k", () => ({ text: "eight" })).text, "eight");
+  assert.equal(memo.size, 1, "window 7 is gone");
+});
+
+test("memo: held to its cap, oldest first", () => {
+  const memo = createBodyMemo({ max: 2 });
+  for (const k of ["a", "b", "c"]) memo.body(1, k, () => ({ text: k }));
+  assert.equal(memo.size, 2);
+  assert.equal(memo.body(1, "a", () => ({ text: "a again" })).text, "a again", "the oldest was dropped");
+  assert.equal(memo.body(1, "c", () => ({ text: "c again" })).text, "c", "the newest was kept");
 });
